@@ -1,0 +1,9 @@
+# Custom partition table for the 16MB-flash T-SIM7670G-S3.
+# No OTA needed (explicit non-goal for this PoC) so a single factory app
+# partition is used. "spiffs" is kept as the subtype/label name because
+# Arduino-ESP32's LittleFS.begin() looks up a partition by that label by
+# default -- it is mounted as LittleFS regardless of the label name.
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   0x5000
+app0,       app,  factory,  0x10000,  0x200000
+spiffs,     data, spiffs,   0x210000, 0x100000
