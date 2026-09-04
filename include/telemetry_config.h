@@ -22,6 +22,23 @@
 // 0 = cellular via the onboard SIM7670G modem (the real deployment path)
 #define TELEMETRY_USE_WIFI 0
 
+// Only used when TELEMETRY_USE_WIFI=1.
+// 1 = SoftAP -- the ESP32-S3 hosts its own WiFi network (WIFI_AP_SSID/
+//     _PASSWORD below); your laptop/phone joins IT and runs the MQTT broker
+//     locally. No existing WiFi network needed at all -- good for field
+//     testing with zero WiFi coverage. Timestamps will NOT be network-synced
+//     in this mode (no internet uplink for NTP); relative inter-frame timing
+//     is unaffected, see README's Known Limitations.
+// 0 = station -- the ESP32-S3 joins an existing WiFi network (WIFI_SSID
+//     below), same as any laptop/phone would.
+#define WIFI_AP_MODE 0
+
+// Used when WIFI_AP_MODE=1. WPA2 requires an 8+ character password; leave
+// WIFI_AP_PASSWORD empty ("") for an open (unencrypted) network instead.
+#define WIFI_AP_SSID           "esp32-telemetry"
+#define WIFI_AP_PASSWORD       "telemetry123"
+
+// Used when WIFI_AP_MODE=0.
 #define WIFI_SSID              "your-wifi-ssid"
 #define WIFI_CONNECT_TIMEOUT_MS  20000
 
@@ -30,14 +47,15 @@
 //     network. Uses PEAP/MSCHAPv2, which covers the large majority of
 //     enterprise networks; EAP-TLS (client-certificate auth) is not supported.
 // 0 = ordinary WPA2/WPA3-Personal -- a single shared network password.
+// Only meaningful when WIFI_AP_MODE=0.
 #define WIFI_ENTERPRISE 0
 
-// Used when WIFI_ENTERPRISE=0.
+// Used when WIFI_AP_MODE=0 and WIFI_ENTERPRISE=0.
 #define WIFI_PASSWORD          "your-wifi-password"
 
-// Used when WIFI_ENTERPRISE=1. Identity can usually be left blank or set
-// equal to the username -- only matters if your network's RADIUS server
-// distinguishes outer/inner identity.
+// Used when WIFI_AP_MODE=0 and WIFI_ENTERPRISE=1. Identity can usually be
+// left blank or set equal to the username -- only matters if your network's
+// RADIUS server distinguishes outer/inner identity.
 #define WIFI_EAP_IDENTITY      ""
 #define WIFI_EAP_USERNAME      "your-network-username"
 #define WIFI_EAP_PASSWORD      "your-network-password"
