@@ -148,7 +148,8 @@ Edit `include/telemetry_config.h`:
 |---|---|
 | `TELEMETRY_USE_SIMULATED_CAN` | `1` = synthetic frames (no CAN hardware needed), `0` = real TWAI driver |
 | `TELEMETRY_USE_WIFI` | `1` = transmit over the ESP32-S3's onboard WiFi radio instead of the cellular modem (bench testing without a SIM); `0` = cellular (default, real deployment path) |
-| `WIFI_SSID`, `WIFI_ENTERPRISE`, `WIFI_PASSWORD` / `WIFI_EAP_*` | Only used when `TELEMETRY_USE_WIFI=1`. Set `WIFI_ENTERPRISE=1` for WPA2/WPA3-Enterprise networks (802.1X, e.g. eduroam or a corporate network) that ask for a username **and** password to join directly -- PEAP/MSCHAPv2 only, not EAP-TLS. Leave it `0` for an ordinary single-password network. |
+| `WIFI_AP_MODE` | Only used when `TELEMETRY_USE_WIFI=1`. `1` = the ESP32-S3 hosts its own network (`WIFI_AP_SSID`/`_PASSWORD`) for your laptop/phone to join directly -- no existing WiFi needed, but no internet uplink either, so point `MQTT_BROKER_HOST` at a broker running on whatever device joins this AP, and note NTP time sync is skipped in this mode. `0` = join an existing network instead (the settings below). |
+| `WIFI_SSID`, `WIFI_ENTERPRISE`, `WIFI_PASSWORD` / `WIFI_EAP_*` | Only used when `TELEMETRY_USE_WIFI=1` and `WIFI_AP_MODE=0`. Set `WIFI_ENTERPRISE=1` for WPA2/WPA3-Enterprise networks (802.1X, e.g. eduroam or a corporate network) that ask for a username **and** password to join directly -- PEAP/MSCHAPv2 only, not EAP-TLS. Leave it `0` for an ordinary single-password network. |
 | `TELEMETRY_APN` / `_USER` / `_PASS` | Your carrier's APN credentials (cellular mode only) |
 | `MQTT_BROKER_HOST` / `_PORT` | Your broker. Ships pointed at the public HiveMQ broker for an initial connectivity smoke test only -- **do not** use it for real vehicle data |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker auth, if required |
