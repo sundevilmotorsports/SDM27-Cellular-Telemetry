@@ -24,6 +24,11 @@ public:
     // never a partial one, since this is a single aligned 8-byte write).
     bool sync(TinyGsm &modem);
 
+    // WiFi-mode equivalent of sync() above: reads the ESP32's SNTP-disciplined
+    // system clock (set up via configTime() once WiFi is connected) instead of
+    // AT+CCLK. Same offset math and same guarantees.
+    bool syncFromSystemClock();
+
     bool isSynced() const { return synced_; }
 
     // Converts a monotonic esp_timer_get_time() capture into epoch milliseconds.
