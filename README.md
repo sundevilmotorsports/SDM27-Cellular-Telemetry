@@ -142,6 +142,13 @@ meaningfully cut per-frame overhead on a Cat-1 link -- see below.
 
 ## Configuration
 
+Non-sensitive settings (transport mode, batching, CAN sim rates) go directly
+in `include/telemetry_config.h`. Credentials (WiFi/APN/MQTT) don't -- copy
+`.env.example` to `.env` (git-ignored) and put real values there instead;
+`load_env.py` injects `.env` at build time as compiler defines, which
+override the placeholders in `telemetry_config.h`. No `.env` -> the
+placeholders are used as-is, so a fresh clone still builds.
+
 Edit `include/telemetry_config.h`:
 
 | Setting | What it controls |
