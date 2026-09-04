@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CAN Telemetry Dashboard</title>
+<script src="mqtt.min.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 20px; background: #111; color: #eee; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  #status { font-size: 13px; margin-bottom: 16px; }
+  #status.connected { color: #4caf50; }
+  #status.disconnected { color: #e53935; }
+  .controls { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+  input { background: #1e1e1e; border: 1px solid #333; color: #eee; padding: 6px 8px; border-radius: 4px; font-family: monospace; }
+  button { background: #2962ff; border: none; color: white; padding: 6px 14px; border-radius: 4px; cursor: pointer; }
+  .stats { display: flex; gap: 24px; margin-bottom: 16px; }
+  .stat { background: #1a1a1a; border-radius: 8px; padding: 10px 16px; }
+  .stat .label { font-size: 11px; color: #888; text-transform: uppercase; }
+  .stat .value { font-size: 22px; font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; font-family: monospace; font-size: 13px; }
+  th, td { text-align: left; padding: 4px 10px; border-bottom: 1px solid #222; }
+  th { color: #888; font-weight: normal; }
+  tbody tr:first-child { background: #1a2a1a; }
+</style>
+</head>
+<body>
+  <h1>ESP32 CAN Telemetry -- Live Dashboard</h1>
+  <div id="status" class="disconnected">disconnected</div>
+
+  <div class="controls">
+    <label>Broker host: <input id="host" value="192.168.4.2"></label>
+    <label>WS port: <input id="port" value="9001" size="6"></label>
+    <label>Topic: <input id="topic" value="esp32_cellular_telemetry/batch" size="30"></label>
+    <button id="connectBtn">Connect</button>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="label">Batches received</div><div class="value" id="batchCount">0</div></div>
+    <div class="stat"><div class="label">Latest seq</div><div class="value" id="latestSeq">--</div></div>
+    <div class="stat"><div class="label">Dropped frames</div><div class="value" id="droppedFrames">0</div></div>
+    <div class="stat"><div class="label">Device ID</div><div class="value" id="deviceId" style="font-size:14px">--</div></div>
+  </div>
+
+  <table>
+    <thead><tr><th>CAN ID</th><th>Ext</th><th>DLC</th><th>Data</th><th>ts_ms</th></tr></thead>
+    <tbody id="frameRows"></tbody>
+  </table>
+
+<script>
+let client = null;
+
+function setStatus(text, connected) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = connected ? 'connected' : 'disconnected';
+}
+
+function renderBatch(batch) {
+  document.getElementById('batchCount').textContent =
+    (parseInt(document.getElementById('batchCount').textContent, 10) || 0) + 1;
+  document.getElementById('latestSeq').textContent = batch.seq;
+  document.getElementById('droppedFrames').textContent = batch.dropped_frames;
+  document.getElementById('deviceId').textContent = batch.device_id;
+
+  const tbody = document.getElementById('frameRows');
+  const rows = (batch.frames || []).slice(-50).reverse().map(f => `
+    <tr>
+      <td>0x${f.can_id.toString(16).toUpperCase()}</td>
+      <td>${f.extd ? 'yes' : 'no'}</td>
+      <td>${f.dlc}</td>
+      <td>${f.data}</td>
+      <td>${f.ts_ms}</td>
+    </tr>`).join('');
+  tbody.innerHTML = rows;
+}
+
+document.getElementById('connectBtn').addEventListener('click', () => {
+  if (client) {
+    client.end(true);
+    client = null;
+  }
+  const host = document.getElementById('host').value.trim();
+  const port = document.getElementById('port').value.trim();
+  const topic = document.getElementById('topic').value.trim();
+  const url = `ws://${host}:${port}`;
+
+  setStatus(`connecting to ${url}...`, false);
+  client = mqtt.connect(url, { connectTimeout: 5000, reconnectPeriod: 2000 });
+
+  client.on('connect', () => {
+    setStatus(`connected to ${url}`, true);
+    client.subscribe(topic);
+  });
+  client.on('reconnect', () => setStatus(`reconnecting to ${url}...`, false));
+  client.on('close', () => setStatus('disconnected', false));
+  client.on('error', (err) => setStatus(`error: ${err.message}`, false));
+
+  client.on('message', (_topic, payload) => {
+    try {
+      renderBatch(JSON.parse(payload.toString()));
+    } catch (e) {
+      console.error('bad payload', e);
+    }
+  });
+});
+</script>
+</body>
+</html>
