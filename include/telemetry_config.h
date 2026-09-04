@@ -16,6 +16,32 @@
 #define SIM_CAN_SLOW_ID       0x200   // e.g. status frame, low rate
 #define SIM_CAN_SLOW_RATE_HZ  5
 
+// ---- Transport ----------------------------------------------------------
+// 1 = WiFi (bench testing without a SIM card/cellular plan; uses the
+//     ESP32-S3's onboard WiFi radio, not the SIM7670G modem)
+// 0 = cellular via the onboard SIM7670G modem (the real deployment path)
+#define TELEMETRY_USE_WIFI 0
+
+#define WIFI_SSID              "your-wifi-ssid"
+#define WIFI_CONNECT_TIMEOUT_MS  20000
+
+// 1 = WPA2/WPA3-Enterprise (802.1X) -- networks that ask for a username AND
+//     password to join directly (no browser), e.g. eduroam or a corporate
+//     network. Uses PEAP/MSCHAPv2, which covers the large majority of
+//     enterprise networks; EAP-TLS (client-certificate auth) is not supported.
+// 0 = ordinary WPA2/WPA3-Personal -- a single shared network password.
+#define WIFI_ENTERPRISE 0
+
+// Used when WIFI_ENTERPRISE=0.
+#define WIFI_PASSWORD          "your-wifi-password"
+
+// Used when WIFI_ENTERPRISE=1. Identity can usually be left blank or set
+// equal to the username -- only matters if your network's RADIUS server
+// distinguishes outer/inner identity.
+#define WIFI_EAP_IDENTITY      ""
+#define WIFI_EAP_USERNAME      "your-network-username"
+#define WIFI_EAP_PASSWORD      "your-network-password"
+
 // ---- Cellular ----------------------------------------------------------
 #define TELEMETRY_APN          "your.apn.here"
 #define TELEMETRY_APN_USER     ""
