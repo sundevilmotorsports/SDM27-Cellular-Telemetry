@@ -2,6 +2,12 @@
 // Fill in your APN and MQTT broker details before flashing the real-CAN or
 // cellular-connectivity paths. The public HiveMQ broker below is fine for an
 // initial connectivity smoke test ONLY -- do not use it for real vehicle data.
+//
+// Credentials (WiFi/APN/MQTT) below are wrapped in #ifndef guards: copy
+// .env.example to .env (git-ignored) and fill in real values there instead
+// of editing them here -- load_env.py injects .env as compiler defines at
+// build time, which pre-empts the placeholder #define in each guard. A
+// fresh clone with no .env still builds fine using the placeholders as-is.
 
 #pragma once
 
@@ -35,11 +41,17 @@
 
 // Used when WIFI_AP_MODE=1. WPA2 requires an 8+ character password; leave
 // WIFI_AP_PASSWORD empty ("") for an open (unencrypted) network instead.
+#ifndef WIFI_AP_SSID
 #define WIFI_AP_SSID           "esp32-telemetry"
+#endif
+#ifndef WIFI_AP_PASSWORD
 #define WIFI_AP_PASSWORD       "telemetry123"
+#endif
 
 // Used when WIFI_AP_MODE=0.
+#ifndef WIFI_SSID
 #define WIFI_SSID              "your-wifi-ssid"
+#endif
 #define WIFI_CONNECT_TIMEOUT_MS  20000
 
 // 1 = WPA2/WPA3-Enterprise (802.1X) -- networks that ask for a username AND
@@ -51,27 +63,51 @@
 #define WIFI_ENTERPRISE 0
 
 // Used when WIFI_AP_MODE=0 and WIFI_ENTERPRISE=0.
+#ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD          "your-wifi-password"
+#endif
 
 // Used when WIFI_AP_MODE=0 and WIFI_ENTERPRISE=1. Identity can usually be
 // left blank or set equal to the username -- only matters if your network's
 // RADIUS server distinguishes outer/inner identity.
+#ifndef WIFI_EAP_IDENTITY
 #define WIFI_EAP_IDENTITY      ""
+#endif
+#ifndef WIFI_EAP_USERNAME
 #define WIFI_EAP_USERNAME      "your-network-username"
+#endif
+#ifndef WIFI_EAP_PASSWORD
 #define WIFI_EAP_PASSWORD      "your-network-password"
+#endif
 
 // ---- Cellular ----------------------------------------------------------
+#ifndef TELEMETRY_APN
 #define TELEMETRY_APN          "your.apn.here"
+#endif
+#ifndef TELEMETRY_APN_USER
 #define TELEMETRY_APN_USER     ""
+#endif
+#ifndef TELEMETRY_APN_PASS
 #define TELEMETRY_APN_PASS     ""
+#endif
+#ifndef TELEMETRY_GSM_PIN
 #define TELEMETRY_GSM_PIN      ""   // SIM PIN, leave empty if none
+#endif
 
 // ---- MQTT ----------------------------------------------------------
 // Public test broker for initial smoke-testing only.
+#ifndef MQTT_BROKER_HOST
 #define MQTT_BROKER_HOST   "broker.hivemq.com"
+#endif
+#ifndef MQTT_BROKER_PORT
 #define MQTT_BROKER_PORT   1883
+#endif
+#ifndef MQTT_USERNAME
 #define MQTT_USERNAME      ""
+#endif
+#ifndef MQTT_PASSWORD
 #define MQTT_PASSWORD      ""
+#endif
 #define MQTT_TOPIC_TELEMETRY  "esp32_cellular_telemetry/batch"
 #define MQTT_CLIENT_ID_PREFIX  "esp32-can-telemetry-"
 // Must comfortably fit BATCH_MAX_FRAMES worth of serialized JSON (~110 bytes/frame).
