@@ -147,7 +147,9 @@ Edit `include/telemetry_config.h`:
 | Setting | What it controls |
 |---|---|
 | `TELEMETRY_USE_SIMULATED_CAN` | `1` = synthetic frames (no CAN hardware needed), `0` = real TWAI driver |
-| `TELEMETRY_APN` / `_USER` / `_PASS` | Your carrier's APN credentials |
+| `TELEMETRY_USE_WIFI` | `1` = transmit over the ESP32-S3's onboard WiFi radio instead of the cellular modem (bench testing without a SIM); `0` = cellular (default, real deployment path) |
+| `WIFI_SSID`, `WIFI_ENTERPRISE`, `WIFI_PASSWORD` / `WIFI_EAP_*` | Only used when `TELEMETRY_USE_WIFI=1`. Set `WIFI_ENTERPRISE=1` for WPA2/WPA3-Enterprise networks (802.1X, e.g. eduroam or a corporate network) that ask for a username **and** password to join directly -- PEAP/MSCHAPv2 only, not EAP-TLS. Leave it `0` for an ordinary single-password network. |
+| `TELEMETRY_APN` / `_USER` / `_PASS` | Your carrier's APN credentials (cellular mode only) |
 | `MQTT_BROKER_HOST` / `_PORT` | Your broker. Ships pointed at the public HiveMQ broker for an initial connectivity smoke test only -- **do not** use it for real vehicle data |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker auth, if required |
 | `MQTT_TOPIC_TELEMETRY` | Publish topic |
@@ -218,3 +220,8 @@ hardware attached. Only flip to `0` once that path is demonstrated working.
 - **CAN filter accepts everything** (`TWAI_FILTER_CONFIG_ACCEPT_ALL()`).
   Fine for a PoC observing all bus traffic; a production node would filter
   to the IDs it actually needs.
+- **WiFi mode (`TELEMETRY_USE_WIFI=1`) is a bench-testing convenience**, not
+  the deployment target -- it lets you prove the batch/MQTT/spool pipeline
+  without a SIM card. It supports WPA2/WPA3-Personal and -Enterprise
+  (PEAP/MSCHAPv2 only); it cannot join a captive-portal network (one with a
+  browser login page), since the ESP32 has no browser to complete that flow.
