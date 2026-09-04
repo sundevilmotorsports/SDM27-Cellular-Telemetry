@@ -5,17 +5,23 @@
 #include "time_sync.h"
 #include "can_handler.h"
 
-#include "gsm_modem.h"
 #include <PubSubClient.h>
 #include <LittleFS.h>
 #include <Arduino.h>
 #include <algorithm>
 #include <vector>
 
+#if TELEMETRY_USE_WIFI
+#include <WiFi.h>
+static WiFiClient netClient;
+#else
+#include "gsm_modem.h"
 static HardwareSerial &SerialAT = Serial1;
 static TinyGsm modem(SerialAT);
-static TinyGsmClient gsmClient(modem);
-static PubSubClient mqtt(gsmClient);
+static TinyGsmClient netClient(modem);
+#endif
+
+static PubSubClient mqtt(netClient);
 
 static uint32_t s_batchSeq = 0;
 static uint32_t s_mqttBackoffMs = MQTT_BACKOFF_INITIAL_MS;
@@ -25,6 +31,41 @@ static uint32_t s_lastBatchMs = 0;
 static uint32_t s_lastTimeSyncMs = 0;
 static int s_spoolFileCounter = 0;
 
+#if TELEMETRY_USE_WIFI
+// ---- WiFi bring-up --------------------------------------------------------
+static void wifiConnectBlocking() {
+    Serial.printf("[net] connecting to WiFi SSID '%s'...\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+#if WIFI_ENTERPRISE
+    // PEAP/MSCHAPv2 (esp_wifi_sta_wpa2_ent_* under the hood) -- covers the
+    // large majority of 802.1X networks; EAP-TLS is not supported here.
+    WiFi.begin(WIFI_SSID, WPA2_AUTH_PEAP, WIFI_EAP_IDENTITY, WIFI_EAP_USERNAME, WIFI_EAP_PASSWORD);
+#else
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#endif
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+        delay(250);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[net] WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+        // Feeds TimeSync::syncFromSystemClock(); the SNTP client keeps this
+        // disciplined in the background for as long as WiFi stays connected.
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    } else {
+        Serial.println("[net] WiFi connect timed out; will keep retrying");
+    }
+}
+
+static bool ensureNetworkConnected() {
+    if (WiFi.status() == WL_CONNECTED) {
+        return true;
+    }
+    wifiConnectBlocking();
+    return WiFi.status() == WL_CONNECTED;
+}
+#else
 // ---- Modem power-on -----------------------------------------------------
 // Sequence transcribed from LilyGo's ATdebug example (examples/ATdebug/ATdebug.ino)
 // for TINY_GSM_MODEM_SIM7670G: reset pulse, DTR low, then a PWRKEY pulse.
@@ -61,7 +102,7 @@ static void modemPowerOn() {
 }
 
 // ---- Registration / GPRS -------------------------------------------------
-static bool ensureNetworkRegistered() {
+static bool ensureNetworkConnected() {
     if (modem.isNetworkConnected() && modem.isGprsConnected()) {
         return true;
     }
@@ -79,6 +120,15 @@ static bool ensureNetworkRegistered() {
     }
     Serial.println("[net] cellular network + PDP context up");
     return true;
+}
+#endif // TELEMETRY_USE_WIFI
+
+static bool networkBearerUp() {
+#if TELEMETRY_USE_WIFI
+    return WiFi.status() == WL_CONNECTED;
+#else
+    return modem.isGprsConnected();
+#endif
 }
 
 // ---- MQTT with capped exponential backoff --------------------------------
@@ -104,8 +154,8 @@ static void maintainMqtt() {
     }
     s_lastMqttAttemptMs = now;
 
-    if (!modem.isGprsConnected()) {
-        return; // no bearer yet; registration maintenance handles this separately
+    if (!networkBearerUp()) {
+        return; // no bearer yet; connection maintenance handles this separately
     }
 
     Serial.printf("[net] MQTT connect attempt (backoff was %lu ms)...\n",
@@ -221,16 +271,20 @@ static void netTask(void *) {
         LittleFS.mkdir(SPOOL_DIR);
     }
 
+#if !TELEMETRY_USE_WIFI
     modemPowerOn();
+#endif
     mqtt.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
     mqtt.setBufferSize(MQTT_BUFFER_SIZE);
 
-    ensureNetworkRegistered();
-    if (g_timeSync.sync(modem)) {
-        Serial.println("[net] initial time sync OK");
-    } else {
-        Serial.println("[net] initial time sync failed; will retry periodically");
-    }
+    ensureNetworkConnected();
+#if TELEMETRY_USE_WIFI
+    bool timeSynced = g_timeSync.syncFromSystemClock();
+#else
+    bool timeSynced = g_timeSync.sync(modem);
+#endif
+    Serial.println(timeSynced ? "[net] initial time sync OK"
+                               : "[net] initial time sync failed; will retry periodically");
     s_lastTimeSyncMs = millis();
     s_lastRegCheckMs = millis();
 
@@ -239,12 +293,16 @@ static void netTask(void *) {
 
         if (now - s_lastRegCheckMs >= MODEM_REGISTRATION_RECHECK_MS) {
             s_lastRegCheckMs = now;
-            ensureNetworkRegistered();
+            ensureNetworkConnected();
         }
 
         if (now - s_lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS) {
             s_lastTimeSyncMs = now;
+#if TELEMETRY_USE_WIFI
+            if (!g_timeSync.syncFromSystemClock()) {
+#else
             if (!g_timeSync.sync(modem)) {
+#endif
                 Serial.println("[net] periodic time sync failed");
             }
         }
