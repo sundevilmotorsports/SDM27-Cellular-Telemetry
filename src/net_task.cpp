@@ -32,7 +32,37 @@ static uint32_t s_lastTimeSyncMs = 0;
 static int s_spoolFileCounter = 0;
 
 #if TELEMETRY_USE_WIFI
-// ---- WiFi bring-up --------------------------------------------------------
+#if WIFI_AP_MODE
+// ---- WiFi SoftAP bring-up ---------------------------------------------
+// The ESP32-S3 hosts its own network instead of joining one. No internet
+// uplink exists in this mode, so NTP time sync is skipped entirely -- only
+// relative (inter-frame) timing stays accurate, per README's Known
+// Limitations. MQTT_BROKER_HOST must point at whatever device (e.g. your
+// laptop, once it joins this AP) is running the broker.
+static bool s_apStarted = false;
+
+static void wifiConnectBlocking() {
+    if (s_apStarted) return;
+    Serial.printf("[net] starting WiFi AP '%s'...\n", WIFI_AP_SSID);
+    WiFi.mode(WIFI_AP);
+    s_apStarted = WiFi.softAP(WIFI_AP_SSID, strlen(WIFI_AP_PASSWORD) ? WIFI_AP_PASSWORD : nullptr);
+    if (s_apStarted) {
+        Serial.printf("[net] AP up, IP: %s -- point MQTT_BROKER_HOST at a broker reachable "
+                      "on this network (e.g. your laptop's IP once it joins)\n",
+                      WiFi.softAPIP().toString().c_str());
+    } else {
+        Serial.println("[net] failed to start WiFi AP");
+    }
+}
+
+static bool ensureNetworkConnected() {
+    if (!s_apStarted) {
+        wifiConnectBlocking();
+    }
+    return s_apStarted;
+}
+#else
+// ---- WiFi station bring-up ---------------------------------------------
 static void wifiConnectBlocking() {
     Serial.printf("[net] connecting to WiFi SSID '%s'...\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
@@ -65,6 +95,7 @@ static bool ensureNetworkConnected() {
     wifiConnectBlocking();
     return WiFi.status() == WL_CONNECTED;
 }
+#endif // WIFI_AP_MODE
 #else
 // ---- Modem power-on -----------------------------------------------------
 // Sequence transcribed from LilyGo's ATdebug example (examples/ATdebug/ATdebug.ino)
@@ -125,7 +156,11 @@ static bool ensureNetworkConnected() {
 
 static bool networkBearerUp() {
 #if TELEMETRY_USE_WIFI
+#if WIFI_AP_MODE
+    return s_apStarted;
+#else
     return WiFi.status() == WL_CONNECTED;
+#endif
 #else
     return modem.isGprsConnected();
 #endif
@@ -278,6 +313,10 @@ static void netTask(void *) {
     mqtt.setBufferSize(MQTT_BUFFER_SIZE);
 
     ensureNetworkConnected();
+#if TELEMETRY_USE_WIFI && WIFI_AP_MODE
+    Serial.println("[net] AP mode has no internet uplink; skipping NTP time sync "
+                    "(inter-frame relative timing is unaffected)");
+#else
 #if TELEMETRY_USE_WIFI
     bool timeSynced = g_timeSync.syncFromSystemClock();
 #else
@@ -285,6 +324,7 @@ static void netTask(void *) {
 #endif
     Serial.println(timeSynced ? "[net] initial time sync OK"
                                : "[net] initial time sync failed; will retry periodically");
+#endif
     s_lastTimeSyncMs = millis();
     s_lastRegCheckMs = millis();
 
@@ -296,6 +336,7 @@ static void netTask(void *) {
             ensureNetworkConnected();
         }
 
+#if !(TELEMETRY_USE_WIFI && WIFI_AP_MODE)
         if (now - s_lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS) {
             s_lastTimeSyncMs = now;
 #if TELEMETRY_USE_WIFI
@@ -306,6 +347,7 @@ static void netTask(void *) {
                 Serial.println("[net] periodic time sync failed");
             }
         }
+#endif
 
         maintainMqtt();
         replaySpooledBatches();
