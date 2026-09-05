@@ -181,6 +181,36 @@ Start with `TELEMETRY_USE_SIMULATED_CAN=1` (the shipped default) to prove out
 cellular connect -> batch -> MQTT publish -> broker receipt with no CAN
 hardware attached. Only flip to `0` once that path is demonstrated working.
 
+## Bench tools (no hardware required)
+
+These let you exercise the full batch -> MQTT -> broker -> subscriber path with
+`TELEMETRY_USE_SIMULATED_CAN=1` and `TELEMETRY_USE_WIFI=1`/`WIFI_AP_MODE=1`
+(the shipped `.env.example` defaults), before any CAN wiring or SIM card is
+involved.
+
+1. **Broker** -- run Mosquitto with the repo's config, which opens both the
+   plain MQTT port the device publishes to and a WebSocket port for the
+   browser dashboard:
+   ```
+   mosquitto -c mosquitto.conf -d
+   ```
+   If your laptop is the SoftAP client (joined the ESP32's `esp32-telemetry`
+   network), it's reachable at `192.168.4.2` -- the default `MQTT_BROKER_HOST`
+   in this mode.
+2. **Raw listener** -- `pip3 install -r requirements.txt`, then:
+   ```
+   python3 listener.py --ap          # points at the SoftAP laptop broker
+   python3 listener.py --simulate    # no broker/device needed; publishes mock frames to itself
+   ```
+   Prints every message's hex dump/decoded text as it arrives -- useful for
+   confirming raw bytes are flowing before trusting the dashboard's parsed
+   view.
+3. **Web dashboard** -- open `web/dashboard.html` directly in a browser (no
+   server needed), leave the broker host/port at their SoftAP defaults
+   (`192.168.4.2:9001`) or point them at your own broker's WebSocket
+   listener, and click Connect. Renders each batch's `frames[]` as a live
+   table plus running batch/seq/dropped-frame counters.
+
 ## Demonstration checklist (real CAN hardware)
 
 1. Set `TELEMETRY_USE_SIMULATED_CAN` to `0`, set `MQTT_BROKER_HOST` to your
