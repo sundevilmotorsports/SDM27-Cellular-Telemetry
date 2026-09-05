@@ -34,6 +34,15 @@ bool TimeSync::sync(TinyGsm &modem) {
         return false;
     }
 
+    // AT+CCLK answers from the modem's RTC, which holds a default date (often
+    // 1980 or 2000) until the network supplies real time. Parsing therefore
+    // succeeds while the modem is still unregistered, and without this check a
+    // bogus epoch gets latched into offset_ms_ and stamped onto every frame --
+    // reported as a successful sync. Mirrors syncFromSystemClock()'s guard.
+    if (year < 2020) {
+        return false;
+    }
+
     struct tm t = {};
     t.tm_year = year - 1900;
     t.tm_mon  = month - 1;
@@ -42,10 +51,20 @@ bool TimeSync::sync(TinyGsm &modem) {
     t.tm_min  = minute;
     t.tm_sec  = second;
 
-    // Treats the struct as UTC; `timezone` (hours east of UTC, from AT+CCLK's
-    // quarter-hour field) shifts local wall-clock -> true UTC.
-    time_t local_as_utc = timegmPortable(&t);
-    time_t epoch_s = local_as_utc - (time_t)(timezone * 3600.0f);
+    // AT+CCLK's time fields are already UTC on this modem, so no timezone shift
+    // is applied. The `timezone` field still reports the *local* zone, and
+    // applying it (as this code originally did) double-corrects.
+    //
+    // Measured on SIM7670G-MNGV / T-Mobile US: a batch stamped 2026-09-06
+    // 01:28:46Z was published at roughly 2026-09-05 18:30Z -- exactly +7h, the
+    // magnitude of the local UTC-7 offset that had been subtracted from an
+    // already-UTC value. Reading `timezone` here would reintroduce that.
+    //
+    // Note this is a modem/carrier behaviour, not a standard: SIMCom parts
+    // differ on whether +CCLK reports UTC or local time. If timestamps land a
+    // whole number of hours off on other hardware, this is the line to revisit.
+    (void)timezone;
+    time_t epoch_s = timegmPortable(&t);
 
     int64_t new_offset_ms = ((int64_t)epoch_s * 1000LL) - (esp_timer_get_time() / 1000);
 
