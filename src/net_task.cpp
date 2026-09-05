@@ -18,7 +18,15 @@ static WiFiClient netClient;
 #include "gsm_modem.h"
 static HardwareSerial &SerialAT = Serial1;
 static TinyGsm modem(SerialAT);
+#if MQTT_USE_TLS
+// TLS runs over the modem's +CCH SSL channel rather than a TCP socket. SNI is
+// enabled by the driver, which multi-tenant brokers like HiveMQ Cloud require
+// to route to the right cluster. Certificate validation is off -- see
+// MQTT_USE_TLS in telemetry_config.h.
+static TinyGsmClientSecure netClient(modem);
+#else
 static TinyGsmClient netClient(modem);
+#endif
 #endif
 
 static PubSubClient mqtt(netClient);
@@ -30,6 +38,8 @@ static uint32_t s_lastRegCheckMs = 0;
 static uint32_t s_lastBatchMs = 0;
 static uint32_t s_lastTimeSyncMs = 0;
 static int s_spoolFileCounter = 0;
+static uint32_t s_lastReplayMs = 0;
+static uint32_t s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
 
 #if TELEMETRY_USE_WIFI
 #if WIFI_AP_MODE
@@ -132,17 +142,59 @@ static void modemPowerOn() {
     Serial.println(modem.getModemInfo());
 }
 
+// Prints the modem state that actually explains a registration failure. Without
+// this, "network registration failed" looks identical whether the antenna is
+// unplugged, the SIM is PIN-locked, the carrier is rejecting the device, or the
+// modem simply needs longer to scan bands -- and those need opposite fixes.
+static void logModemDiagnostics() {
+    int simStatus = modem.getSimStatus();
+    const char *simText = simStatus == SIM_READY   ? "ready"
+                          : simStatus == SIM_LOCKED ? "LOCKED -- set TELEMETRY_GSM_PIN in .env"
+                          : simStatus == SIM_ANTITHEFT_LOCKED ? "anti-theft locked"
+                                                              : "error / not detected";
+    Serial.printf("[net]   SIM: %s (%d)\n", simText, simStatus);
+
+    // CSQ is 0..31, or 99 for "unknown". RSSI dBm = -113 + 2*CSQ, so anything
+    // below ~10 (-93 dBm) is marginal and 99 usually means no antenna.
+    int16_t csq = modem.getSignalQuality();
+    if (csq == 99 || csq < 0) {
+        Serial.println("[net]   signal: none (CSQ 99) -- check the antenna is connected");
+    } else {
+        Serial.printf("[net]   signal: CSQ %d (~%d dBm)%s\n", csq, -113 + 2 * csq,
+                      csq < 10 ? " -- marginal" : "");
+    }
+
+    RegStatus reg = modem.getRegistrationStatus();
+    const char *regText;
+    switch (reg) {
+        case REG_UNREGISTERED: regText = "not registered, not searching"; break;
+        case REG_OK_HOME:      regText = "registered (home)"; break;
+        case REG_SEARCHING:    regText = "searching -- may just need more time"; break;
+        case REG_DENIED:       regText = "DENIED by carrier -- SIM not provisioned for this device"; break;
+        case REG_OK_ROAMING:   regText = "registered (roaming)"; break;
+        case REG_SMS_ONLY:     regText = "SMS only -- no data service on this SIM"; break;
+        default:               regText = "unknown"; break;
+    }
+    Serial.printf("[net]   registration (CEREG): %s (%d)\n", regText, (int)reg);
+
+    String op = modem.getOperator();
+    Serial.printf("[net]   operator: %s\n", op.length() ? op.c_str() : "(none)");
+}
+
 // ---- Registration / GPRS -------------------------------------------------
 static bool ensureNetworkConnected() {
     if (modem.isNetworkConnected() && modem.isGprsConnected()) {
         return true;
     }
     Serial.println("[net] (re)connecting to cellular network...");
-    if (strlen(TELEMETRY_GSM_PIN) && modem.getSimStatus() != 3) {
+    // SIM_READY, not the literal 3 -- 3 is SIM_ANTITHEFT_LOCKED (TinyGsmGPRS.tpp),
+    // so the old comparison skipped the unlock only in a case that never applies.
+    if (strlen(TELEMETRY_GSM_PIN) && modem.getSimStatus() != SIM_READY) {
         modem.simUnlock(TELEMETRY_GSM_PIN);
     }
-    if (!modem.waitForNetwork(30000)) {
+    if (!modem.waitForNetwork(MODEM_REGISTRATION_TIMEOUT_MS)) {
         Serial.println("[net] network registration failed");
+        logModemDiagnostics();
         return false;
     }
     if (!modem.gprsConnect(TELEMETRY_APN, TELEMETRY_APN_USER, TELEMETRY_APN_PASS)) {
@@ -205,6 +257,31 @@ static void maintainMqtt() {
 }
 
 // ---- Offline spooling (LittleFS) -----------------------------------------
+// Resume numbering above the highest spool file already on disk. LittleFS
+// survives reboots and reflashes, but this counter did not: it restarted at 0
+// every boot, so a new run overwrote the batches a previous run had spooled --
+// silently destroying exactly the data spooling exists to preserve, and
+// leaving a mix of old and new files sharing the same names.
+static void initSpoolCounter() {
+    File dir = LittleFS.open(SPOOL_DIR);
+    if (!dir || !dir.isDirectory()) return;
+
+    int maxIdx = -1;
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        String name(f.name());
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0) {
+            name = name.substring(slash + 1);  // some cores report a full path
+        }
+        int idx = name.toInt();  // "0000000004.json" -> 4
+        if (idx > maxIdx) maxIdx = idx;
+    }
+    s_spoolFileCounter = maxIdx + 1;
+    if (s_spoolFileCounter > 0) {
+        Serial.printf("[net] resuming spool numbering at %d\n", s_spoolFileCounter);
+    }
+}
+
 static void spoolBatch(const String &json) {
     // Drop-oldest cap: if the spool directory is full, delete the oldest
     // file before writing a new one, mirroring the in-memory queue's policy.
@@ -234,8 +311,18 @@ static void spoolBatch(const String &json) {
 
 // Replays a bounded number of spooled batches per call so this never starves
 // live traffic if a large backlog has built up.
+//
+// Rate-limited with backoff. Without it this runs on every pass of the net
+// task's 50ms loop, so a batch that cannot publish is retried ~20x/second --
+// each attempt shoving kilobytes at the modem over TLS. That saturates the AT
+// channel, starves live publishes, and on a metered SIM costs real money to
+// achieve nothing.
 static void replaySpooledBatches() {
     if (!mqtt.connected()) return;
+
+    uint32_t now = millis();
+    if (now - s_lastReplayMs < s_replayBackoffMs) return;
+    s_lastReplayMs = now;
 
     File dir = LittleFS.open(SPOOL_DIR);
     if (!dir || !dir.isDirectory()) return;
@@ -256,11 +343,34 @@ static void replaySpooledBatches() {
         String payload = f.readString();
         f.close();
 
+        // A batch larger than the MQTT buffer can never publish -- PubSubClient
+        // rejects it before touching the network. LittleFS survives reflashing,
+        // so a file spooled under an older, larger BATCH_MAX_FRAMES outlives the
+        // config that produced it. Retrying is futile and, because the loop
+        // below breaks on failure, one such file blocks every good batch behind
+        // it forever. Drop it and say so loudly.
+        if (payload.length() + strlen(MQTT_TOPIC_TELEMETRY) + 16 > MQTT_BUFFER_SIZE) {
+            Serial.printf("[net] discarding %s: %u bytes exceeds MQTT buffer (%u) -- "
+                          "spooled under a previous config, can never publish\n",
+                          path.c_str(), (unsigned)payload.length(),
+                          (unsigned)MQTT_BUFFER_SIZE);
+            LittleFS.remove(path);
+            continue;
+        }
+
         if (mqtt.publish(MQTT_TOPIC_TELEMETRY, payload.c_str())) {
             LittleFS.remove(path);
             replayed++;
+            s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
         } else {
-            Serial.println("[net] spool replay publish failed, will retry later");
+            // Back off rather than spin: the failure is almost always the modem
+            // being busy, and retrying immediately guarantees it still is.
+            s_replayBackoffMs = std::min<uint32_t>(s_replayBackoffMs * 2,
+                                                   SPOOL_REPLAY_MAX_BACKOFF_MS);
+            Serial.printf("[net] spool replay failed for %s (%u bytes, mqtt state=%d), "
+                          "retry in %lu ms\n",
+                          path.c_str(), (unsigned)payload.length(), mqtt.state(),
+                          (unsigned long)s_replayBackoffMs);
             break;
         }
     }
@@ -304,6 +414,8 @@ static void netTask(void *) {
         Serial.println("[net] LittleFS mount/format failed; spooling disabled");
     } else if (!LittleFS.exists(SPOOL_DIR)) {
         LittleFS.mkdir(SPOOL_DIR);
+    } else {
+        initSpoolCounter();
     }
 
 #if !TELEMETRY_USE_WIFI
