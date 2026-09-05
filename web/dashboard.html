@@ -30,7 +30,11 @@
   <div class="controls">
     <label>Broker host: <input id="host" value="192.168.4.2"></label>
     <label>WS port: <input id="port" value="9001" size="6"></label>
+    <label><input type="checkbox" id="tls"> TLS</label>
+    <label>Path: <input id="path" value="" size="7" placeholder="/mqtt"></label>
     <label>Topic: <input id="topic" value="esp32_cellular_telemetry/batch" size="30"></label>
+    <label>User: <input id="username" size="12" autocomplete="off"></label>
+    <label>Pass: <input id="password" type="password" size="12" autocomplete="off"></label>
     <button id="connectBtn">Connect</button>
   </div>
 
@@ -38,6 +42,7 @@
     <div class="stat"><div class="label">Batches received</div><div class="value" id="batchCount">0</div></div>
     <div class="stat"><div class="label">Latest seq</div><div class="value" id="latestSeq">--</div></div>
     <div class="stat"><div class="label">Dropped frames</div><div class="value" id="droppedFrames">0</div></div>
+    <div class="stat"><div class="label">Payload received</div><div class="value" id="bytesTotal">0 B</div></div>
     <div class="stat"><div class="label">Device ID</div><div class="value" id="deviceId" style="font-size:14px">--</div></div>
   </div>
 
@@ -48,6 +53,17 @@
 
 <script>
 let client = null;
+
+// Sum of raw JSON payload bytes seen on the topic. This is a floor on what the
+// SIM was billed, not the actual figure -- it excludes MQTT packet headers,
+// TCP/IP framing and any retransmits, so real cellular usage runs higher.
+let bytesTotal = 0;
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
 
 function setStatus(text, connected) {
   const el = document.getElementById('status');
@@ -82,10 +98,27 @@ document.getElementById('connectBtn').addEventListener('click', () => {
   const host = document.getElementById('host').value.trim();
   const port = document.getElementById('port').value.trim();
   const topic = document.getElementById('topic').value.trim();
-  const url = `ws://${host}:${port}`;
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+  const path = document.getElementById('path').value.trim();
+
+  // Local mosquitto: ws://host:9001 with no path. HiveMQ Cloud and most
+  // hosted brokers: wss://host:8884/mqtt -- TLS only, and the /mqtt path is
+  // required, not optional. A page served over https:// can only open wss://
+  // anyway, so browsers will block the plaintext option there regardless.
+  const scheme = document.getElementById('tls').checked ? 'wss' : 'ws';
+  const url = `${scheme}://${host}:${port}${path}`;
+
+  const opts = { connectTimeout: 5000, reconnectPeriod: 2000 };
+  // Omitted entirely rather than sent empty -- mosquitto rejects a CONNECT
+  // carrying a zero-length username when allow_anonymous is false.
+  if (username) {
+    opts.username = username;
+    opts.password = password;
+  }
 
   setStatus(`connecting to ${url}...`, false);
-  client = mqtt.connect(url, { connectTimeout: 5000, reconnectPeriod: 2000 });
+  client = mqtt.connect(url, opts);
 
   client.on('connect', () => {
     setStatus(`connected to ${url}`, true);
@@ -96,6 +129,10 @@ document.getElementById('connectBtn').addEventListener('click', () => {
   client.on('error', (err) => setStatus(`error: ${err.message}`, false));
 
   client.on('message', (_topic, payload) => {
+    // Counted before parsing, so a malformed batch still shows up as data
+    // that crossed the link and got billed.
+    bytesTotal += payload.length;
+    document.getElementById('bytesTotal').textContent = formatBytes(bytesTotal);
     try {
       renderBatch(JSON.parse(payload.toString()));
     } catch (e) {
