@@ -14,7 +14,9 @@
 // ---- CAN source mode --------------------------------------------------
 // 1 = simulated CAN frames (no hardware CAN bus required)
 // 0 = real CAN frames via the ESP32-S3 TWAI controller + external transceiver
+#ifndef TELEMETRY_USE_SIMULATED_CAN
 #define TELEMETRY_USE_SIMULATED_CAN 1
+#endif
 
 // Simulated CAN generator settings (only used when TELEMETRY_USE_SIMULATED_CAN=1)
 #define SIM_CAN_FAST_ID       0x100   // e.g. wheel speed / RPM, high rate
@@ -26,7 +28,9 @@
 // 1 = WiFi (bench testing without a SIM card/cellular plan; uses the
 //     ESP32-S3's onboard WiFi radio, not the SIM7670G modem)
 // 0 = cellular via the onboard SIM7670G modem (the real deployment path)
+#ifndef TELEMETRY_USE_WIFI
 #define TELEMETRY_USE_WIFI 0
+#endif
 
 // Only used when TELEMETRY_USE_WIFI=1.
 // 1 = SoftAP -- the ESP32-S3 hosts its own WiFi network (WIFI_AP_SSID/
@@ -37,7 +41,9 @@
 //     is unaffected, see README's Known Limitations.
 // 0 = station -- the ESP32-S3 joins an existing WiFi network (WIFI_SSID
 //     below), same as any laptop/phone would.
+#ifndef WIFI_AP_MODE
 #define WIFI_AP_MODE 0
+#endif
 
 // Used when WIFI_AP_MODE=1. WPA2 requires an 8+ character password; leave
 // WIFI_AP_PASSWORD empty ("") for an open (unencrypted) network instead.
@@ -95,9 +101,14 @@
 #endif
 
 // ---- MQTT ----------------------------------------------------------
-// Public test broker for initial smoke-testing only.
+// Default broker: if running in SoftAP mode, default to 192.168.4.2 (laptop IP).
+// Otherwise, public test broker for initial smoke-testing only.
 #ifndef MQTT_BROKER_HOST
+#if (TELEMETRY_USE_WIFI && WIFI_AP_MODE)
+#define MQTT_BROKER_HOST   "192.168.4.2"
+#else
 #define MQTT_BROKER_HOST   "broker.hivemq.com"
+#endif
 #endif
 #ifndef MQTT_BROKER_PORT
 #define MQTT_BROKER_PORT   1883
