@@ -10,6 +10,7 @@ topic, hex dump, decoded text, and raw byte representation).
 import argparse
 import os
 import signal
+import ssl
 import struct
 import sys
 import threading
@@ -77,14 +78,14 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
     if is_success:
         topic = userdata.get("topic", "esp32_cellular_telemetry/batch")
-        print(f"\n{'='*70}")
-        print(f"[{get_timestamp()}] [+] CONNECTED to MQTT Broker at {userdata['host']}:{userdata['port']}")
+        print(f"\n{'='*70}", flush=True)
+        print(f"[{get_timestamp()}] [+] CONNECTED to MQTT Broker at {userdata['host']}:{userdata['port']}", flush=True)
         client.subscribe(topic)
-        print(f"[{get_timestamp()}] [*] Subscribed to topic: {topic}")
-        print(f"[{get_timestamp()}] [*] Listening for raw signals... (Press Ctrl+C to stop)")
-        print(f"{'='*70}\n")
+        print(f"[{get_timestamp()}] [*] Subscribed to topic: {topic}", flush=True)
+        print(f"[{get_timestamp()}] [*] Listening for raw signals... (Press Ctrl+C to stop)", flush=True)
+        print(f"{'='*70}\n", flush=True)
     else:
-        print(f"[{get_timestamp()}] [-] Connection failed with reason/code: {rc}")
+        print(f"[{get_timestamp()}] [-] Connection failed with reason/code: {rc}", flush=True)
         if userdata.get("host") in ("192.168.4.1",):
             print("    [!] Hint: 192.168.4.1 is the ESP32 (client publisher), NOT an MQTT broker.")
             print("        Run Mosquitto on your laptop and point listener to your laptop IP (e.g. 192.168.4.2).")
@@ -110,6 +111,20 @@ def on_message(client, userdata, msg):
     length = len(payload)
     text_repr = format_text_if_printable(payload)
     hex_dump = format_hex(payload)
+
+    if userdata.get("brief"):
+        import json
+        try:
+            parsed = json.loads(payload.decode("utf-8"))
+            seq = parsed.get("seq", "-")
+            frames = len(parsed.get("frames", []))
+            dropped = parsed.get("dropped_frames", 0)
+            dev = parsed.get("device_id", "dev")
+            print(f"[{timestamp}] #{current_num:04d} {topic} [{dev} seq={seq} frames={frames} dropped={dropped}] ({length}B)")
+        except Exception:
+            text = text_repr or f"{length} bytes"
+            print(f"[{timestamp}] #{current_num:04d} {topic} ({text})")
+        return
 
     print(f"\n--- [MESSAGE #{current_num}] {timestamp} ---")
     print(f"  Topic   : {topic}")
@@ -220,6 +235,11 @@ def main():
         action="store_true",
         help="Shortcut for SoftAP mode: sets host to 192.168.4.2 (Mac broker on esp32-telemetry)",
     )
+    parser.add_argument(
+        "--brief",
+        action="store_true",
+        help="Print compact one-line summary per message instead of full hex dump",
+    )
 
     args = parser.parse_args()
 
@@ -232,6 +252,7 @@ def main():
         "host": args.host,
         "port": args.port,
         "topic": args.topic,
+        "brief": args.brief,
     }
 
     # Initialize MQTT client with API version compatibility
@@ -246,6 +267,19 @@ def main():
             client_id=args.client_id,
             userdata=userdata,
         )
+
+    # Automatically enable TLS when connecting to standard secure port 8883 (e.g. HiveMQ Cloud)
+    if args.port == 8883:
+        ca_certs = None
+        try:
+            import certifi
+            ca_certs = certifi.where()
+        except ImportError:
+            for path in ("/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt"):
+                if os.path.exists(path):
+                    ca_certs = path
+                    break
+        client.tls_set(ca_certs=ca_certs)
 
     # Set authentication if provided
     if args.username:
@@ -289,13 +323,12 @@ def main():
     print("Tip: If broker or device is not online yet, listener will automatically keep retrying.\n")
 
     try:
-        # connect_async allows loop_forever to retry automatically even if the broker is not yet reachable
-        client.connect_async(args.host, args.port, keepalive=60)
-        client.loop_forever(retry_first_connection=True)
+        client.connect(args.host, args.port, keepalive=60)
+        client.loop_forever()
     except KeyboardInterrupt:
         handle_sigint(None, None)
     except Exception as e:
-        print(f"[{get_timestamp()}] Error: {e}")
+        print(f"[{get_timestamp()}] Connection Error: {e}", flush=True)
         sys.exit(1)
 
 
