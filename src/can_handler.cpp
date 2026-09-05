@@ -20,14 +20,26 @@ uint32_t canHandlerTakeDroppedCount() {
 
 // Pushes a captured frame onto the shared queue without blocking. If full,
 // drops the oldest queued frame first (never the CAN task itself).
+//
+// The evict-then-retry is a loop rather than a straight-line
+// send/receive/send because the net task drains this same queue from the
+// other core (net_task.cpp's drainAndPublish), truly in parallel -- this
+// task's higher priority does not serialize the two. A slot can therefore
+// free up between a failed send and the eviction below, and evicting
+// unconditionally in that case would discard a live frame, and report a
+// drop, that overflow never actually forced. Re-testing the send each pass
+// evicts only when the queue is still genuinely full.
+//
+// Terminates in at most a couple of passes: this is the only producer, so
+// once a slot is freed (or the consumer has emptied the queue outright)
+// nothing can refill it ahead of the retry.
 static void pushFrame(const CanFrame &frame) {
-    if (xQueueSend(g_canQueue, &frame, 0) == pdTRUE) {
-        return;
+    while (xQueueSend(g_canQueue, &frame, 0) != pdTRUE) {
+        CanFrame discard;
+        if (xQueueReceive(g_canQueue, &discard, 0) == pdTRUE) {
+            s_droppedFrames.fetch_add(1, std::memory_order_relaxed);
+        }
     }
-    CanFrame discard;
-    xQueueReceive(g_canQueue, &discard, 0);
-    s_droppedFrames.fetch_add(1, std::memory_order_relaxed);
-    xQueueSend(g_canQueue, &frame, 0); // queue just had a slot freed; won't fail
 }
 
 #if TELEMETRY_USE_SIMULATED_CAN
