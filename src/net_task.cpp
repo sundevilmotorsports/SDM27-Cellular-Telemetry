@@ -379,6 +379,80 @@ static void replaySpooledBatches() {
     }
 }
 
+// ---- Uplink stress test ---------------------------------------------------
+#if TELEMETRY_STRESS_TEST
+// Runs once, the first time MQTT is connected after boot: publishes fixed
+// filler payloads back-to-back for STRESS_TEST_DURATION_S, through the same
+// mqtt.publish() -> PubSubClient -> TLS -> AT+CCHSEND path real batches use,
+// and logs achieved throughput against STRESS_TARGET_BPS. Blocks the net
+// task for the duration -- deliberate, so measured throughput reflects only
+// this path's own speed, not this loop's normal 50ms tick.
+static void runStressTest() {
+    static bool done = false;
+    if (done || !mqtt.connected()) return;
+    done = true;
+
+    String filler;
+    filler.reserve(STRESS_FILLER_BYTES);
+    for (uint32_t i = 0; i < STRESS_FILLER_BYTES; i++) {
+        filler += char('a' + (i % 26));
+    }
+
+    Serial.printf("[stress] starting %us burst on '%s', target %lu bps, "
+                  "~%u bytes/publish -- this spends real cellular data\n",
+                  (unsigned)STRESS_TEST_DURATION_S, MQTT_TOPIC_STRESS,
+                  (unsigned long)STRESS_TARGET_BPS, (unsigned)STRESS_FILLER_BYTES);
+
+    uint32_t startMs = millis();
+    uint32_t lastLogMs = startMs;
+    uint32_t windowBytes = 0;
+    uint32_t totalBytes = 0;
+    uint32_t seq = 0;
+
+    while (millis() - startMs < STRESS_TEST_DURATION_S * 1000UL) {
+        if (!mqtt.connected()) {
+            Serial.println("[stress] MQTT dropped mid-burst, stopping early");
+            break;
+        }
+
+        String json;
+        json.reserve(STRESS_FILLER_BYTES + 96);
+        json = "{\"device_id\":\"" TELEMETRY_DEVICE_ID "\",\"stress_seq\":";
+        json += seq++;
+        json += ",\"pad\":\"";
+        json += filler;
+        json += "\"}";
+
+        if (mqtt.publish(MQTT_TOPIC_STRESS, json.c_str())) {
+            windowBytes += json.length();
+            totalBytes += json.length();
+        }
+        mqtt.loop();
+        yield(); // avoid starving the core-1 watchdog across a tight loop
+
+        uint32_t now = millis();
+        if (now - lastLogMs >= STRESS_LOG_INTERVAL_MS) {
+            uint32_t windowMs = now - lastLogMs;
+            uint32_t bps = (uint32_t)((uint64_t)windowBytes * 8000ULL / windowMs);
+            Serial.printf("[stress] %lu bps (target %lu), %lu bytes so far\n",
+                          (unsigned long)bps, (unsigned long)STRESS_TARGET_BPS,
+                          (unsigned long)totalBytes);
+            windowBytes = 0;
+            lastLogMs = now;
+        }
+    }
+
+    uint32_t elapsedMs = millis() - startMs;
+    uint32_t avgBps = elapsedMs > 0
+                           ? (uint32_t)((uint64_t)totalBytes * 8000ULL / elapsedMs)
+                           : 0;
+    Serial.printf("[stress] done: %lu bytes over %lu ms, avg %lu bps (target %lu bps)\n",
+                  (unsigned long)totalBytes, (unsigned long)elapsedMs,
+                  (unsigned long)avgBps, (unsigned long)STRESS_TARGET_BPS);
+    Serial.println("[stress] resuming normal telemetry publishing");
+}
+#endif
+
 // ---- Batch drain + publish ------------------------------------------------
 static void drainAndPublish() {
     TelemetryBatch batch;
@@ -462,6 +536,9 @@ static void netTask(void *) {
 #endif
 
         maintainMqtt();
+#if TELEMETRY_STRESS_TEST
+        runStressTest(); // no-ops after its first (and only) run
+#endif
         replaySpooledBatches();
 
         if (now - s_lastBatchMs >= BATCH_WINDOW_MS) {
