@@ -209,40 +209,75 @@ def run_simulator(host: str, port: int, stop_event: threading.Event):
         print(f"[{get_timestamp()}] [SIMULATOR ERROR] {e}")
 
 
+def load_env_file(path: str = ".env") -> dict:
+    """Read key-value pairs from .env file into os.environ if not already set."""
+    if not os.path.isfile(path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, ".env")
+        if not os.path.isfile(path):
+            return {}
+    loaded = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                if key not in os.environ:
+                    os.environ[key] = value
+                loaded[key] = value
+    except Exception:
+        pass
+    return loaded
+
+
 def main():
+    load_env_file()
+
+    default_host = os.getenv("MQTT_HOST") or os.getenv("MQTT_BROKER_HOST", "localhost")
+    default_port = int(os.getenv("MQTT_PORT") or os.getenv("MQTT_BROKER_PORT", "1883"))
+    default_topic = os.getenv("MQTT_TOPIC") or os.getenv("MQTT_TOPIC_TELEMETRY", "esp32_cellular_telemetry/batch")
+    default_user = os.getenv("MQTT_USER") or os.getenv("MQTT_USERNAME", None)
+    default_pass = os.getenv("MQTT_PASSWORD", None)
+
     parser = argparse.ArgumentParser(
         description="Capture and print raw MQTT signals on port 1883 (e.g. CAN telemetry data)."
     )
     parser.add_argument(
         "-H",
         "--host",
-        default=os.getenv("MQTT_HOST", "localhost"),
-        help="MQTT broker hostname or IP address (default: localhost, or $MQTT_HOST)",
+        default=default_host,
+        help=f"MQTT broker hostname or IP address (default: {default_host})",
     )
     parser.add_argument(
         "-p",
         "--port",
         type=int,
-        default=int(os.getenv("MQTT_PORT", "1883")),
-        help="MQTT broker port (default: 1883, or $MQTT_PORT)",
+        default=default_port,
+        help=f"MQTT broker port (default: {default_port})",
     )
     parser.add_argument(
         "-t",
         "--topic",
-        default=os.getenv("MQTT_TOPIC", "esp32_cellular_telemetry/batch"),
-        help="MQTT topic to subscribe to (default: 'esp32_cellular_telemetry/batch', or $MQTT_TOPIC)",
+        default=default_topic,
+        help=f"MQTT topic to subscribe to (default: '{default_topic}')",
     )
     parser.add_argument(
         "-u",
         "--username",
-        default=os.getenv("MQTT_USER", None),
-        help="Username for broker authentication (optional, or $MQTT_USER)",
+        default=default_user,
+        help="Username for broker authentication (optional)",
     )
     parser.add_argument(
         "-P",
         "--password",
-        default=os.getenv("MQTT_PASSWORD", None),
-        help="Password for broker authentication (optional, or $MQTT_PASSWORD)",
+        default=default_pass,
+        help="Password for broker authentication (optional)",
     )
     parser.add_argument(
         "-c",
