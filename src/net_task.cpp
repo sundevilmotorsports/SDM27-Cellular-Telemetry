@@ -408,6 +408,20 @@ static void runStressTest() {
     uint32_t windowBytes = 0;
     uint32_t totalBytes = 0;
     uint32_t seq = 0;
+    // Each mqtt.publish() call is chunked to MQTT_MAX_TRANSFER_SIZE bytes,
+    // and every chunk is one synchronous AT+CCHSEND round-trip (send AT cmd
+    // -> wait for '>' -> write bytes -> wait for the modem's confirmation)
+    // before the next chunk can start. Timing publish() itself and dividing
+    // by the chunk count it implied tells us whether that round-trip's fixed
+    // AT/modem/network turnaround dominates, or the ~22ms/chunk that raw
+    // serial transfer of 255 bytes takes at 115200 baud does -- i.e. whether
+    // raising MODEM_BAUDRATE would actually help, or whether the fix is
+    // fewer, larger chunks instead (which this PubSubClient version can't do
+    // -- see MQTT_MAX_TRANSFER_SIZE's comment in platformio.ini).
+    uint32_t windowPublishMs = 0;
+    uint32_t windowChunks = 0;
+    uint64_t totalPublishMs = 0;
+    uint32_t totalChunks = 0;
 
     while (millis() - startMs < STRESS_TEST_DURATION_S * 1000UL) {
         if (!mqtt.connected()) {
@@ -423,9 +437,17 @@ static void runStressTest() {
         json += filler;
         json += "\"}";
 
-        if (mqtt.publish(MQTT_TOPIC_STRESS, json.c_str())) {
+        uint32_t pubStartMs = millis();
+        bool ok = mqtt.publish(MQTT_TOPIC_STRESS, json.c_str());
+        uint32_t pubMs = millis() - pubStartMs;
+        if (ok) {
+            uint32_t chunks = (json.length() + MQTT_MAX_TRANSFER_SIZE - 1) / MQTT_MAX_TRANSFER_SIZE;
             windowBytes += json.length();
             totalBytes += json.length();
+            windowPublishMs += pubMs;
+            windowChunks += chunks;
+            totalPublishMs += pubMs;
+            totalChunks += chunks;
         }
         mqtt.loop();
         yield(); // avoid starving the core-1 watchdog across a tight loop
@@ -434,10 +456,16 @@ static void runStressTest() {
         if (now - lastLogMs >= STRESS_LOG_INTERVAL_MS) {
             uint32_t windowMs = now - lastLogMs;
             uint32_t bps = (uint32_t)((uint64_t)windowBytes * 8000ULL / windowMs);
-            Serial.printf("[stress] %lu bps (target %lu), %lu bytes so far\n",
+            uint32_t msPerChunkX10 =
+                windowChunks > 0 ? (uint32_t)((uint64_t)windowPublishMs * 10 / windowChunks) : 0;
+            Serial.printf("[stress] %lu bps (target %lu), %lu.%lu ms/AT+CCHSEND chunk, "
+                          "%lu bytes so far\n",
                           (unsigned long)bps, (unsigned long)STRESS_TARGET_BPS,
+                          (unsigned long)(msPerChunkX10 / 10), (unsigned long)(msPerChunkX10 % 10),
                           (unsigned long)totalBytes);
             windowBytes = 0;
+            windowPublishMs = 0;
+            windowChunks = 0;
             lastLogMs = now;
         }
     }
@@ -446,9 +474,16 @@ static void runStressTest() {
     uint32_t avgBps = elapsedMs > 0
                            ? (uint32_t)((uint64_t)totalBytes * 8000ULL / elapsedMs)
                            : 0;
+    uint32_t avgMsPerChunkX10 =
+        totalChunks > 0 ? (uint32_t)(totalPublishMs * 10 / totalChunks) : 0;
     Serial.printf("[stress] done: %lu bytes over %lu ms, avg %lu bps (target %lu bps)\n",
                   (unsigned long)totalBytes, (unsigned long)elapsedMs,
                   (unsigned long)avgBps, (unsigned long)STRESS_TARGET_BPS);
+    Serial.printf("[stress] avg %lu.%lu ms per %d-byte AT+CCHSEND chunk over %lu chunks -- "
+                  "~22ms of that is pure serial transfer at 115200 baud; the rest is AT "
+                  "command / modem / network round-trip overhead\n",
+                  (unsigned long)(avgMsPerChunkX10 / 10), (unsigned long)(avgMsPerChunkX10 % 10),
+                  (int)MQTT_MAX_TRANSFER_SIZE, (unsigned long)totalChunks);
     Serial.println("[stress] resuming normal telemetry publishing");
 }
 #endif
