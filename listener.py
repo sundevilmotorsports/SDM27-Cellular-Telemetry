@@ -15,6 +15,7 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 try:
@@ -37,6 +38,11 @@ byte_counter = 0
 counter_lock = threading.Lock()
 running = True
 start_time = time.monotonic()
+# (monotonic_ts, payload_len) for messages in roughly the last second, used to
+# report instantaneous throughput -- the number a stress test actually cares
+# about, since the cumulative average is slow to reflect a rate that changes.
+recent_samples = deque()
+RECENT_WINDOW_S = 1.0
 
 
 def format_bytes(n: int) -> str:
@@ -46,6 +52,15 @@ def format_bytes(n: int) -> str:
     if n < 1024 * 1024:
         return f"{n / 1024:.1f} KB"
     return f"{n / (1024 * 1024):.2f} MB"
+
+
+def format_bps(bits_per_sec: float) -> str:
+    """Human-readable bit rate."""
+    if bits_per_sec < 1000:
+        return f"{bits_per_sec:.0f} bps"
+    if bits_per_sec < 1_000_000:
+        return f"{bits_per_sec / 1000:.1f} Kbps"
+    return f"{bits_per_sec / 1_000_000:.2f} Mbps"
 
 
 def get_timestamp() -> str:
@@ -120,11 +135,22 @@ def on_message(client, userdata, msg):
     """Callback when a message arrives."""
     global message_counter, byte_counter
     payload = msg.payload
+    now_m = time.monotonic()
     with counter_lock:
         message_counter += 1
         byte_counter += len(payload)
         current_num = message_counter
         total_bytes = byte_counter
+
+        recent_samples.append((now_m, len(payload)))
+        while recent_samples and now_m - recent_samples[0][0] > RECENT_WINDOW_S:
+            recent_samples.popleft()
+        # Divide by the fixed window, not the span between the oldest and
+        # newest sample still in it -- a burst of messages arriving close
+        # together (e.g. right after a gap) would otherwise shrink that span
+        # toward zero and report an absurd spike for a handful of bytes.
+        window_span = min(now_m - start_time, RECENT_WINDOW_S)
+        inst_bps = sum(n for _, n in recent_samples) * 8 / max(window_span, 1e-6)
 
     timestamp = get_timestamp()
     topic = msg.topic
@@ -133,19 +159,22 @@ def on_message(client, userdata, msg):
 
     # Extrapolate observed throughput to an hourly figure -- the number that
     # actually matters when the publisher is on a metered SIM.
-    elapsed = max(time.monotonic() - start_time, 1e-6)
+    elapsed = max(now_m - start_time, 1e-6)
     per_hour = total_bytes / elapsed * 3600
-    data_totals = f"{format_bytes(total_bytes)} total, ~{format_bytes(int(per_hour))}/hr"
+    data_totals = f"{format_bytes(total_bytes)} total, ~{format_bytes(int(per_hour))}/hr, now {format_bps(inst_bps)}"
 
     if userdata.get("brief"):
         import json
         try:
             parsed = json.loads(payload.decode("utf-8"))
-            seq = parsed.get("seq", "-")
-            frames = len(parsed.get("frames", []))
-            dropped = parsed.get("dropped_frames", 0)
-            dev = parsed.get("device_id", "dev")
-            print(f"[{timestamp}] #{current_num:04d} {topic} [{dev} seq={seq} frames={frames} dropped={dropped}] ({length}B, {data_totals})")
+            if "stress_seq" in parsed:
+                print(f"[{timestamp}] #{current_num:04d} {topic} [stress seq={parsed['stress_seq']}] ({length}B, {data_totals})")
+            else:
+                seq = parsed.get("seq", "-")
+                frames = len(parsed.get("frames", []))
+                dropped = parsed.get("dropped_frames", 0)
+                dev = parsed.get("device_id", "dev")
+                print(f"[{timestamp}] #{current_num:04d} {topic} [{dev} seq={seq} frames={frames} dropped={dropped}] ({length}B, {data_totals})")
         except Exception:
             text = text_repr or f"{length} bytes"
             print(f"[{timestamp}] #{current_num:04d} {topic} ({text})")
@@ -297,6 +326,13 @@ def main():
         help="Shortcut for SoftAP mode: sets host to 192.168.4.2 (Mac broker on esp32-telemetry)",
     )
     parser.add_argument(
+        "--stress",
+        action="store_true",
+        help="Shortcut for watching a TELEMETRY_STRESS_TEST run: subscribes to "
+        "'<topic>/stress' instead of the normal telemetry topic. Combine with "
+        "-b to see live throughput per message.",
+    )
+    parser.add_argument(
         "-b",
         "--brief",
         action="store_true",
@@ -329,6 +365,10 @@ def main():
     # If --ap is set and host wasn't overridden from default localhost, use SoftAP laptop IP
     if args.ap and args.host == os.getenv("MQTT_HOST", "localhost"):
         args.host = "192.168.4.2"
+
+    # If --stress is set and topic wasn't overridden, watch the stress topic instead
+    if args.stress and args.topic == default_topic:
+        args.topic = f"{default_topic}/stress"
 
     # User context dictionary passed to callbacks
     userdata = {
