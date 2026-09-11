@@ -163,6 +163,7 @@ Edit `include/telemetry_config.h`:
 | `MQTT_TOPIC_TELEMETRY` | Publish topic |
 | `TELEMETRY_DEVICE_ID` | Identifies this device in every batch |
 | `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES` | Batching/backpressure tuning |
+| `TELEMETRY_STRESS_TEST` | `1` = run a one-time, time-bounded uplink throughput burst after MQTT connects (see [Uplink stress test](#uplink-stress-test)); `0` = normal operation (default) |
 
 CAN bitrate is in `include/can_pins.h` (`CAN_BITRATE_KBPS`, default 500
 kbit/s) -- **must match the vehicle bus you're connecting to**; body/comfort
@@ -232,6 +233,34 @@ involved.
    the next batch's `dropped_frames` is nonzero and spooled batches (from
    LittleFS) replay in order.
 
+## Uplink stress test
+
+Set `TELEMETRY_STRESS_TEST=1` in `include/telemetry_config.h` (or via `.env`)
+to run a one-time throughput burst: once MQTT connects, the device publishes
+fixed filler payloads back-to-back on `MQTT_TOPIC_TELEMETRY/stress` for
+`STRESS_TEST_DURATION_S` (default 60s), through the same
+`mqtt.publish -> TLS -> AT+CCHSEND -> modem` path real batches use, and logs
+achieved bits/sec against `STRESS_TARGET_BPS` (default 5 Mbps, the SIM7670G's
+Cat-1 uplink spec ceiling). It runs exactly once per boot, then the device
+resumes normal telemetry publishing.
+
+Watch it land with the listener:
+
+```
+python3 listener.py --stress -b
+```
+
+**Read this before running it on cellular:** it is designed to try to move
+tens of megabytes over `STRESS_TEST_DURATION_S`, and every byte it manages to
+push is real billed data on a metered SIM -- there is no dry-run mode. It is
+also very unlikely to get anywhere near the 5 Mbps target: `MODEM_BAUDRATE`
+(`include/board_pins.h`) is 115200 baud, i.e. ~92 Kbps raw across the
+ESP32<->modem UART, before `AT+CCHSEND` framing and `MQTT_MAX_TRANSFER_SIZE`'s
+255-byte chunking (`platformio.ini`) each take their own cut -- that UART, not
+the cellular link or MQTT/TLS, is almost certainly the bottleneck. The test's
+purpose is to measure and report the actual ceiling, not to hit the target;
+a result well under 5 Mbps is the expected finding, not a bug in the test.
+
 ## Known limitations
 
 - **Timestamp accuracy** is bounded by the modem's network-time
@@ -258,6 +287,11 @@ involved.
 - **CAN filter accepts everything** (`TWAI_FILTER_CONFIG_ACCEPT_ALL()`).
   Fine for a PoC observing all bus traffic; a production node would filter
   to the IDs it actually needs.
+- **~92 Kbps hard ceiling on the cellular uplink**, regardless of the
+  SIM7670G's own Cat-1 spec (~5 Mbps): `MODEM_BAUDRATE` is 115200 baud across
+  the ESP32<->modem UART, and every byte sent over cellular crosses that UART
+  via `AT+CCHSEND` first. See [Uplink stress test](#uplink-stress-test) for a
+  way to measure the real achievable number.
 - **WiFi mode (`TELEMETRY_USE_WIFI=1`) is a bench-testing convenience**, not
   the deployment target -- it lets you prove the batch/MQTT/spool pipeline
   without a SIM card. It supports WPA2/WPA3-Personal and -Enterprise
