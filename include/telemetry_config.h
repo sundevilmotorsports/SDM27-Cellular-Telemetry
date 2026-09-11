@@ -20,10 +20,15 @@
 
 // Simulated CAN generator settings (only used when
 // TELEMETRY_USE_SIMULATED_CAN=1)
+// NOTE: these rates are deliberately far below a real bus's. On a metered SIM
+// the generator rate, not the batching, sets your data bill: every simulated
+// frame costs ~90 bytes of JSON on the wire. 100+5 Hz (the original bench
+// values, fine over WiFi) works out to ~34 MB/hour. Raise these only when the
+// link is unmetered.
 #define SIM_CAN_FAST_ID 0x100 // e.g. wheel speed / RPM, high rate
-#define SIM_CAN_FAST_RATE_HZ 100
+#define SIM_CAN_FAST_RATE_HZ 1
 #define SIM_CAN_SLOW_ID 0x200 // e.g. status frame, low rate
-#define SIM_CAN_SLOW_RATE_HZ 5
+#define SIM_CAN_SLOW_RATE_HZ 1
 
 // ---- Transport ----------------------------------------------------------
 // 1 = WiFi (bench testing without a SIM card/cellular plan; uses the
@@ -111,8 +116,29 @@
 #define MQTT_BROKER_HOST "broker.hivemq.com"
 #endif
 #endif
+// 1 = MQTT over TLS. Required by hosted brokers (HiveMQ Cloud, EMQX
+//     Serverless) which refuse plaintext connections entirely.
+// 0 = plaintext MQTT.
+//
+// Cellular only. The WiFi path uses a plain WiFiClient and would need a
+// WiFiClientSecure to match; not wired up, because WiFi mode exists for bench
+// testing against a local broker where TLS buys nothing.
+//
+// Caveat worth knowing: the TinyGSM fork leaves AT+CSSLCFG "authmode" at 0
+// (TinyGsmClientSIM7672.h, modemConnect), so the link is encrypted but the
+// broker's certificate is NOT validated -- this stops passive eavesdropping,
+// not an active man-in-the-middle. Loading a CA cert onto the modem and
+// calling setCertificate() would close that gap.
+#ifndef MQTT_USE_TLS
+#define MQTT_USE_TLS 0
+#endif
+
 #ifndef MQTT_BROKER_PORT
+#if MQTT_USE_TLS
+#define MQTT_BROKER_PORT 8883
+#else
 #define MQTT_BROKER_PORT 1883
+#endif
 #endif
 #ifndef MQTT_USERNAME
 #define MQTT_USERNAME ""
@@ -120,21 +146,29 @@
 #ifndef MQTT_PASSWORD
 #define MQTT_PASSWORD ""
 #endif
+// Guarded so a deployment can pick its own topic from .env without editing a
+// tracked file -- useful when one broker carries more than one device, or to
+// keep the topic off an easily-guessed default.
+#ifndef MQTT_TOPIC_TELEMETRY
 #define MQTT_TOPIC_TELEMETRY "esp32_cellular_telemetry/batch"
+#endif
 #define MQTT_CLIENT_ID_PREFIX "esp32-can-telemetry-"
 // Must comfortably fit BATCH_MAX_FRAMES worth of serialized JSON (~110
 // bytes/frame). PubSubClient allocates this on the regular heap, not PSRAM --
 // if you raise BATCH_MAX_FRAMES, raise this too and watch for allocation
 // failures at boot.
-#define MQTT_BUFFER_SIZE 16384
+#define MQTT_BUFFER_SIZE 8192
 
 // ---- Device identity -----------------------------------------------
 #define TELEMETRY_DEVICE_ID "esp32-sim7670g-poc-01"
 
 // ---- Batching / queue -----------------------------------------------
-#define CAN_QUEUE_DEPTH 512  // frames; oldest dropped when full
-#define BATCH_WINDOW_MS 1000 // how often the net task drains the queue
-#define BATCH_MAX_FRAMES 200 // hard cap on frames per published batch
+// A wider window amortizes the per-publish overhead (MQTT header + TCP/IP
+// segment) over more frames, which matters on a metered link -- but it does
+// NOT reduce the per-frame cost, so it can't rescue a high generator rate.
+#define CAN_QUEUE_DEPTH 512   // frames; oldest dropped when full
+#define BATCH_WINDOW_MS 15000 // how often the net task drains the queue
+#define BATCH_MAX_FRAMES 60   // hard cap on frames per published batch
 
 // ---- Wall-clock (epoch) sync -----------------------------------------
 #define TIME_SYNC_INTERVAL_MS (5UL * 60UL * 1000UL) // resync every 5 minutes
@@ -143,7 +177,17 @@
 #define MQTT_BACKOFF_INITIAL_MS 1000
 #define MQTT_BACKOFF_MAX_MS 60000
 #define MODEM_REGISTRATION_RECHECK_MS (30UL * 1000UL)
+// How long to wait for the modem to attach to the network. A cold modem on an
+// unfamiliar network can spend well over 30s scanning LTE bands before it
+// registers, so a short timeout reports a failure that was only slowness.
+#define MODEM_REGISTRATION_TIMEOUT_MS (90UL * 1000UL)
 
 // ---- Offline spooling (LittleFS) --------------------------------------
 #define SPOOL_DIR "/spool"
 #define SPOOL_MAX_FILES 100 // oldest spooled batch dropped beyond this
+// Replay pacing. The net task loops every 50ms, so without a floor here a
+// batch that fails to publish is retried 20x/second -- each attempt pushing
+// kilobytes at the modem over TLS, saturating the AT channel and burning data
+// on a metered SIM to accomplish nothing.
+#define SPOOL_REPLAY_INTERVAL_MS 2000
+#define SPOOL_REPLAY_MAX_BACKOFF_MS 60000

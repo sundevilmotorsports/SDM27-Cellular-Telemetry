@@ -2,6 +2,7 @@
 .vscode/
 .DS_Store
 .env
+.venv/
 CLAUDE.md
 __pycache__/
-.venv/
+.mosquitto/

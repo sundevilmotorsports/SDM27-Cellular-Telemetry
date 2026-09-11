@@ -30,8 +30,22 @@ except ImportError:
 
 # Global state
 message_counter = 0
+# Cumulative payload bytes received. This is a floor on what the publishing
+# SIM was billed for, not the real figure -- it excludes MQTT packet headers,
+# TCP/IP framing, keepalives and any retransmits.
+byte_counter = 0
 counter_lock = threading.Lock()
 running = True
+start_time = time.monotonic()
+
+
+def format_bytes(n: int) -> str:
+    """Human-readable byte count."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.2f} MB"
 
 
 def get_timestamp() -> str:
@@ -86,7 +100,11 @@ def on_connect(client, userdata, flags, rc, properties=None):
         print(f"{'='*70}\n", flush=True)
     else:
         print(f"[{get_timestamp()}] [-] Connection failed with reason/code: {rc}", flush=True)
-        if userdata.get("host") in ("192.168.4.1",):
+        if "not authorised" in str(rc).lower() or str(rc) == "5":
+            print("    [!] Broker rejected the credentials. On a hosted broker such as")
+            print("        HiveMQ Cloud, create them under Access Management first, and")
+            print("        pass them with -u/-P (the cluster refuses anonymous clients).")
+        elif userdata.get("host") in ("192.168.4.1",):
             print("    [!] Hint: 192.168.4.1 is the ESP32 (client publisher), NOT an MQTT broker.")
             print("        Run Mosquitto on your laptop and point listener to your laptop IP (e.g. 192.168.4.2).")
         elif userdata.get("host") in ("localhost", "127.0.0.1"):
@@ -100,17 +118,24 @@ def on_disconnect(client, userdata, disconnect_flags_or_rc, reason_code=None, pr
 
 def on_message(client, userdata, msg):
     """Callback when a message arrives."""
-    global message_counter
+    global message_counter, byte_counter
+    payload = msg.payload
     with counter_lock:
         message_counter += 1
+        byte_counter += len(payload)
         current_num = message_counter
+        total_bytes = byte_counter
 
     timestamp = get_timestamp()
-    payload = msg.payload
     topic = msg.topic
     length = len(payload)
     text_repr = format_text_if_printable(payload)
-    hex_dump = format_hex(payload)
+
+    # Extrapolate observed throughput to an hourly figure -- the number that
+    # actually matters when the publisher is on a metered SIM.
+    elapsed = max(time.monotonic() - start_time, 1e-6)
+    per_hour = total_bytes / elapsed * 3600
+    data_totals = f"{format_bytes(total_bytes)} total, ~{format_bytes(int(per_hour))}/hr"
 
     if userdata.get("brief"):
         import json
@@ -120,7 +145,7 @@ def on_message(client, userdata, msg):
             frames = len(parsed.get("frames", []))
             dropped = parsed.get("dropped_frames", 0)
             dev = parsed.get("device_id", "dev")
-            print(f"[{timestamp}] #{current_num:04d} {topic} [{dev} seq={seq} frames={frames} dropped={dropped}] ({length}B)")
+            print(f"[{timestamp}] #{current_num:04d} {topic} [{dev} seq={seq} frames={frames} dropped={dropped}] ({length}B, {data_totals})")
         except Exception:
             text = text_repr or f"{length} bytes"
             print(f"[{timestamp}] #{current_num:04d} {topic} ({text})")
@@ -130,8 +155,9 @@ def on_message(client, userdata, msg):
     print(f"  Topic   : {topic}")
     print(f"  QoS / R : {msg.qos} / {'Retained' if msg.retain else 'Live'}")
     print(f"  Length  : {length} bytes")
+    print(f"  Data    : {data_totals} at this rate")
     print("  Hex Dump:")
-    print(hex_dump)
+    print(format_hex(payload))
     if text_repr:
         print(f"  Text    : {text_repr}")
     print(f"  Raw Byte: {payload!r}")
@@ -236,9 +262,31 @@ def main():
         help="Shortcut for SoftAP mode: sets host to 192.168.4.2 (Mac broker on esp32-telemetry)",
     )
     parser.add_argument(
+        "-b",
         "--brief",
         action="store_true",
-        help="Print compact one-line summary per message instead of full hex dump",
+        help="Print a compact one-line summary per message, with running data "
+        "totals, instead of the full hex dump. Recommended for JSON batches, "
+        "which are several KB each",
+    )
+    parser.add_argument(
+        "--tls",
+        action="store_true",
+        help="Connect over TLS. Implied by --port 8883. Required for hosted "
+        "brokers such as HiveMQ Cloud, which refuse plaintext connections",
+    )
+    parser.add_argument(
+        "--cafile",
+        default=os.getenv("MQTT_CAFILE", None),
+        help="CA bundle for TLS verification (default: $MQTT_CAFILE, else "
+        "certifi's bundle if installed, else a common system bundle). Only "
+        "needed for a broker using a private CA",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Skip TLS certificate verification. Debugging only -- this makes "
+        "the connection vulnerable to interception",
     )
 
     args = parser.parse_args()
@@ -268,22 +316,37 @@ def main():
             userdata=userdata,
         )
 
-    # Automatically enable TLS when connecting to standard secure port 8883 (e.g. HiveMQ Cloud)
-    if args.port == 8883:
-        ca_certs = None
-        try:
-            import certifi
-            ca_certs = certifi.where()
-        except ImportError:
-            for path in ("/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt"):
-                if os.path.exists(path):
-                    ca_certs = path
-                    break
-        client.tls_set(ca_certs=ca_certs)
-
     # Set authentication if provided
     if args.username:
         client.username_pw_set(args.username, args.password)
+
+    # 8883 is the registered port for MQTT over TLS, so treat it as implying
+    # --tls: pointing this at a hosted broker and forgetting the flag otherwise
+    # fails with an opaque timeout rather than anything that names the cause.
+    use_tls = args.tls or args.port == 8883
+    if use_tls:
+        # An explicit --cafile wins; otherwise prefer certifi, then a common
+        # system bundle. Some Python installs have no usable default trust
+        # store, so leaving this to OpenSSL's defaults can fail verification
+        # against a perfectly valid public certificate.
+        ca_certs = args.cafile
+        if ca_certs is None:
+            try:
+                import certifi
+                ca_certs = certifi.where()
+            except ImportError:
+                for path in ("/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt"):
+                    if os.path.exists(path):
+                        ca_certs = path
+                        break
+        # Exactly one tls_set() call: paho raises ValueError on a second one.
+        client.tls_set(ca_certs=ca_certs)
+        if args.insecure:
+            client.tls_insecure_set(True)
+            print(
+                f"[{get_timestamp()}] [!] TLS certificate verification DISABLED "
+                "-- connection is encrypted but the broker is unauthenticated"
+            )
 
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
@@ -297,7 +360,14 @@ def main():
         stop_event.set()
         client.disconnect()
         client.loop_stop()
+        elapsed = max(time.monotonic() - start_time, 1e-6)
         print(f"[{get_timestamp()}] Total raw messages captured: {message_counter}")
+        print(
+            f"[{get_timestamp()}] Total payload received: {format_bytes(byte_counter)} "
+            f"over {elapsed / 60:.1f} min "
+            f"(~{format_bytes(int(byte_counter / elapsed * 3600))}/hr)"
+        )
+        print(f"[{get_timestamp()}] Note: actual SIM usage is higher -- excludes MQTT/TCP overhead.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_sigint)
@@ -312,7 +382,10 @@ def main():
         )
         sim_thread.start()
 
-    print(f"[{get_timestamp()}] Connecting to MQTT broker at {args.host}:{args.port}...")
+    print(
+        f"[{get_timestamp()}] Connecting to MQTT broker at {args.host}:{args.port} "
+        f"({'TLS' if use_tls else 'plaintext'})..."
+    )
     print(f"[{get_timestamp()}] Subscribing to: '{args.topic}'")
     if args.host in ("localhost", "127.0.0.1"):
         print("Note: To allow the ESP32 on WiFi to reach your broker, ensure Mosquitto was started with:")
