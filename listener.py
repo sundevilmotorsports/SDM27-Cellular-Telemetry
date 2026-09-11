@@ -10,6 +10,7 @@ topic, hex dump, decoded text, and raw byte representation).
 import argparse
 import os
 import signal
+import ssl
 import struct
 import sys
 import threading
@@ -91,14 +92,14 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
     if is_success:
         topic = userdata.get("topic", "esp32_cellular_telemetry/batch")
-        print(f"\n{'='*70}")
-        print(f"[{get_timestamp()}] [+] CONNECTED to MQTT Broker at {userdata['host']}:{userdata['port']}")
+        print(f"\n{'='*70}", flush=True)
+        print(f"[{get_timestamp()}] [+] CONNECTED to MQTT Broker at {userdata['host']}:{userdata['port']}", flush=True)
         client.subscribe(topic)
-        print(f"[{get_timestamp()}] [*] Subscribed to topic: {topic}")
-        print(f"[{get_timestamp()}] [*] Listening for raw signals... (Press Ctrl+C to stop)")
-        print(f"{'='*70}\n")
+        print(f"[{get_timestamp()}] [*] Subscribed to topic: {topic}", flush=True)
+        print(f"[{get_timestamp()}] [*] Listening for raw signals... (Press Ctrl+C to stop)", flush=True)
+        print(f"{'='*70}\n", flush=True)
     else:
-        print(f"[{get_timestamp()}] [-] Connection failed with reason/code: {rc}")
+        print(f"[{get_timestamp()}] [-] Connection failed with reason/code: {rc}", flush=True)
         if "not authorised" in str(rc).lower() or str(rc) == "5":
             print("    [!] Broker rejected the credentials. On a hosted broker such as")
             print("        HiveMQ Cloud, create them under Access Management first, and")
@@ -134,24 +135,32 @@ def on_message(client, userdata, msg):
     # actually matters when the publisher is on a metered SIM.
     elapsed = max(time.monotonic() - start_time, 1e-6)
     per_hour = total_bytes / elapsed * 3600
+    data_totals = f"{format_bytes(total_bytes)} total, ~{format_bytes(int(per_hour))}/hr"
+
+    if userdata.get("brief"):
+        import json
+        try:
+            parsed = json.loads(payload.decode("utf-8"))
+            seq = parsed.get("seq", "-")
+            frames = len(parsed.get("frames", []))
+            dropped = parsed.get("dropped_frames", 0)
+            dev = parsed.get("device_id", "dev")
+            print(f"[{timestamp}] #{current_num:04d} {topic} [{dev} seq={seq} frames={frames} dropped={dropped}] ({length}B, {data_totals})")
+        except Exception:
+            text = text_repr or f"{length} bytes"
+            print(f"[{timestamp}] #{current_num:04d} {topic} ({text})")
+        return
 
     print(f"\n--- [MESSAGE #{current_num}] {timestamp} ---")
     print(f"  Topic   : {topic}")
     print(f"  QoS / R : {msg.qos} / {'Retained' if msg.retain else 'Live'}")
     print(f"  Length  : {length} bytes")
-    print(f"  Data    : {format_bytes(total_bytes)} total, ~{format_bytes(int(per_hour))}/hr at this rate")
-
-    if userdata.get("brief"):
-        # A batch of 30 frames is ~2.7 KB, which is ~170 lines of hex dump --
-        # unreadable in a live terminal, so show only the decoded JSON.
-        if text_repr:
-            print(f"  Text    : {text_repr}")
-    else:
-        print("  Hex Dump:")
-        print(format_hex(payload))
-        if text_repr:
-            print(f"  Text    : {text_repr}")
-        print(f"  Raw Byte: {payload!r}")
+    print(f"  Data    : {data_totals} at this rate")
+    print("  Hex Dump:")
+    print(format_hex(payload))
+    if text_repr:
+        print(f"  Text    : {text_repr}")
+    print(f"  Raw Byte: {payload!r}")
 
 
 def run_simulator(host: str, port: int, stop_event: threading.Event):
@@ -256,8 +265,9 @@ def main():
         "-b",
         "--brief",
         action="store_true",
-        help="Skip the hex dump and raw-bytes lines, printing only the decoded "
-        "payload. Recommended for JSON batches, which are several KB each",
+        help="Print a compact one-line summary per message, with running data "
+        "totals, instead of the full hex dump. Recommended for JSON batches, "
+        "which are several KB each",
     )
     parser.add_argument(
         "--tls",
@@ -268,8 +278,9 @@ def main():
     parser.add_argument(
         "--cafile",
         default=os.getenv("MQTT_CAFILE", None),
-        help="CA bundle for TLS verification (default: the system trust store, "
-        "or $MQTT_CAFILE). Only needed for a broker using a private CA",
+        help="CA bundle for TLS verification (default: $MQTT_CAFILE, else "
+        "certifi's bundle if installed, else a common system bundle). Only "
+        "needed for a broker using a private CA",
     )
     parser.add_argument(
         "--insecure",
@@ -314,7 +325,22 @@ def main():
     # fails with an opaque timeout rather than anything that names the cause.
     use_tls = args.tls or args.port == 8883
     if use_tls:
-        client.tls_set(ca_certs=args.cafile)
+        # An explicit --cafile wins; otherwise prefer certifi, then a common
+        # system bundle. Some Python installs have no usable default trust
+        # store, so leaving this to OpenSSL's defaults can fail verification
+        # against a perfectly valid public certificate.
+        ca_certs = args.cafile
+        if ca_certs is None:
+            try:
+                import certifi
+                ca_certs = certifi.where()
+            except ImportError:
+                for path in ("/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt"):
+                    if os.path.exists(path):
+                        ca_certs = path
+                        break
+        # Exactly one tls_set() call: paho raises ValueError on a second one.
+        client.tls_set(ca_certs=ca_certs)
         if args.insecure:
             client.tls_insecure_set(True)
             print(
@@ -370,13 +396,12 @@ def main():
     print("Tip: If broker or device is not online yet, listener will automatically keep retrying.\n")
 
     try:
-        # connect_async allows loop_forever to retry automatically even if the broker is not yet reachable
-        client.connect_async(args.host, args.port, keepalive=60)
-        client.loop_forever(retry_first_connection=True)
+        client.connect(args.host, args.port, keepalive=60)
+        client.loop_forever()
     except KeyboardInterrupt:
         handle_sigint(None, None)
     except Exception as e:
-        print(f"[{get_timestamp()}] Error: {e}")
+        print(f"[{get_timestamp()}] Connection Error: {e}", flush=True)
         sys.exit(1)
 
 
