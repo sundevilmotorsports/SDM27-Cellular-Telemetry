@@ -30,6 +30,52 @@
 #define SIM_CAN_SLOW_ID 0x200 // e.g. status frame, low rate
 #define SIM_CAN_SLOW_RATE_HZ 1
 
+// ---- Uplink stress test ---------------------------------------------------
+// Opt-in, off by default. When on, once MQTT connects the net task runs a
+// bounded burst of publishes -- fixed synthetic "pad" payloads back-to-back,
+// through the real batch JSON -> mqtt.publish -> TLS -> AT+CCHSEND -> modem
+// path, as fast as that path allows -- and logs the achieved throughput
+// against STRESS_TARGET_BPS. It does NOT touch the real CAN sim/batching
+// settings above: reaching a few Mbps by raising SIM_CAN_*_RATE_HZ and
+// BATCH_MAX_FRAMES isn't possible anyway, since canSimTask's loop
+// (can_handler.cpp) floors its own sleep at 1ms/pass (~1000 frames/sec max)
+// and each real CAN frame carries only 8 payload bytes.
+//
+// Read this before running it on a metered SIM: at STRESS_TARGET_BPS (5
+// Mbps) for STRESS_TEST_DURATION_S (60s) this is *designed* to try to move
+// ~37 MB. It will very likely fall far short of that -- see the ceiling
+// below -- but it will still spend whatever it manages to push, and that is
+// real billed data, not a simulation.
+//
+// The likely actual ceiling: MODEM_BAUDRATE (board_pins.h) is 115200 baud,
+// i.e. ~11.5 KB/s (~92 Kbps) raw across the ESP32<->modem UART -- before
+// AT+CCHSEND command framing and MQTT_MAX_TRANSFER_SIZE's 255-byte chunking
+// (platformio.ini) each take their own cut. That UART link, not the
+// cellular RF link, a Cat-1 modem's ~5 Mbps spec, or MQTT/TLS, is almost
+// certainly the bottleneck -- 5 Mbps is ~50x what 115200 baud can carry no
+// matter what runs on top of it. This test exists to measure and report the
+// real number, not to force the target; do not read a result well under 5
+// Mbps as a bug.
+#ifndef TELEMETRY_STRESS_TEST
+#define TELEMETRY_STRESS_TEST 0
+#endif
+// Bits/sec this run is being measured against (5 Mbps = the SIM7670G's Cat-1
+// uplink spec ceiling). Only affects what's printed, not what's sent.
+#define STRESS_TARGET_BPS (5UL * 1000UL * 1000UL)
+// Filler bytes per publish, sent as a JSON string field ("pad") alongside a
+// device_id/seq header, so publishes are big enough to approach the target
+// without needing an unrealistic CAN frame rate. Must comfortably fit under
+// MQTT_BUFFER_SIZE together with that header -- default headroom is ~4KB.
+#define STRESS_FILLER_BYTES 4096
+// Hard cap on how long the burst runs before it stops and prints a summary,
+// so a run left connected can't keep burning metered data indefinitely.
+// Runs once per boot; power-cycle or reflash to run it again.
+#define STRESS_TEST_DURATION_S 60
+// How often to log the throughput measured so far while the burst runs.
+#define STRESS_LOG_INTERVAL_MS 1000
+// MQTT_TOPIC_STRESS (derived from MQTT_TOPIC_TELEMETRY) is defined down in
+// the MQTT section below, once that macro exists.
+
 // ---- Transport ----------------------------------------------------------
 // 1 = WiFi (bench testing without a SIM card/cellular plan; uses the
 //     ESP32-S3's onboard WiFi radio, not the SIM7670G modem)
@@ -152,12 +198,26 @@
 #ifndef MQTT_TOPIC_TELEMETRY
 #define MQTT_TOPIC_TELEMETRY "esp32_cellular_telemetry/batch"
 #endif
+// Where TELEMETRY_STRESS_TEST publishes -- kept off the real telemetry topic
+// so a listener/dashboard subscribed to MQTT_TOPIC_TELEMETRY never sees it.
+#ifndef MQTT_TOPIC_STRESS
+#define MQTT_TOPIC_STRESS MQTT_TOPIC_TELEMETRY "/stress"
+#endif
 #define MQTT_CLIENT_ID_PREFIX "esp32-can-telemetry-"
 // Must comfortably fit BATCH_MAX_FRAMES worth of serialized JSON (~110
 // bytes/frame). PubSubClient allocates this on the regular heap, not PSRAM --
 // if you raise BATCH_MAX_FRAMES, raise this too and watch for allocation
 // failures at boot.
 #define MQTT_BUFFER_SIZE 8192
+
+// A stress publish is a device_id/seq header plus a STRESS_FILLER_BYTES
+// "pad" string; PubSubClient::publish() silently drops anything over
+// MQTT_BUFFER_SIZE rather than sending a truncated packet, so this would
+// fail every publish with no obvious cause. 256 bytes of headroom covers
+// the header at any TELEMETRY_DEVICE_ID/seq length actually used here.
+#if TELEMETRY_STRESS_TEST && (STRESS_FILLER_BYTES + 256 > MQTT_BUFFER_SIZE)
+#error "STRESS_FILLER_BYTES leaves no room under MQTT_BUFFER_SIZE -- raise MQTT_BUFFER_SIZE or lower STRESS_FILLER_BYTES"
+#endif
 
 // ---- Device identity -----------------------------------------------
 #define TELEMETRY_DEVICE_ID "esp32-sim7670g-poc-01"
