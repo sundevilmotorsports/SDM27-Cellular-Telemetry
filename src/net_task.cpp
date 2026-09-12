@@ -16,6 +16,10 @@
 #error "SMS_TEST_ENABLED requires cellular (TELEMETRY_USE_WIFI=0) -- there is no modem to send SMS through in WiFi mode"
 #endif
 
+#if MODEM_USB_BENCH_MODE && TELEMETRY_USE_WIFI
+#error "MODEM_USB_BENCH_MODE requires cellular (TELEMETRY_USE_WIFI=0) -- there is no modem in WiFi mode"
+#endif
+
 #if TELEMETRY_USE_WIFI
 #include <WiFi.h>
 static WiFiClient netClient;
@@ -559,6 +563,14 @@ static void netTask(void *) {
 
 #if !TELEMETRY_USE_WIFI
     modemPowerOn();
+#if MODEM_USB_BENCH_MODE
+    Serial.println("[net] MODEM_USB_BENCH_MODE=1 -- modem is powered on and idle, "
+                    "UART1 will stay silent from here on. Drive it over its own "
+                    "USB port instead (see usb_modem_bench.py).");
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
 #endif
     mqtt.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
     mqtt.setBufferSize(MQTT_BUFFER_SIZE);

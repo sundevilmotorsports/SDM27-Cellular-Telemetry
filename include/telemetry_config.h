@@ -76,6 +76,23 @@
 // MQTT_TOPIC_STRESS (derived from MQTT_TOPIC_TELEMETRY) is defined down in
 // the MQTT section below, once that macro exists.
 
+// ---- USB direct-to-modem bench mode ---------------------------------------
+// 1 = power the modem on, then stop -- the ESP32 never opens its own AT
+//     session past that (no registration, no MQTT, no stress test). Leaves
+//     UART1 silent so the SIM7670G's OWN USB port (the separate microUSB
+//     next to the modem, wired straight to the modem chip -- not the ESP32's
+//     Type-C port) is free for a PC to drive directly, e.g. with
+//     usb_modem_bench.py. The point is measuring throughput without the
+//     ESP32<->modem UART1 link (115200 baud, see MODEM_BAUDRATE) in the path
+//     at all, instead of through AT+CCHSEND/AT+CIPSEND issued by this
+//     firmware.
+// 0 = off (default) -- normal operation.
+// Cellular only, same reasoning as SMS_TEST_ENABLED -- build error under
+// TELEMETRY_USE_WIFI=1 (see the check in net_task.cpp).
+#ifndef MODEM_USB_BENCH_MODE
+#define MODEM_USB_BENCH_MODE 0
+#endif
+
 // ---- Transport ----------------------------------------------------------
 // 1 = WiFi (bench testing without a SIM card/cellular plan; uses the
 //     ESP32-S3's onboard WiFi radio, not the SIM7670G modem)
