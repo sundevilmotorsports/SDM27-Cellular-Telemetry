@@ -1,6 +1,7 @@
 #include "net_task.h"
 #include "board_pins.h"
 #include "telemetry_config.h"
+#include "sms_config.h"
 #include "telemetry_format.h"
 #include "time_sync.h"
 #include "can_handler.h"
@@ -10,6 +11,14 @@
 #include <Arduino.h>
 #include <algorithm>
 #include <vector>
+
+#if SMS_TEST_ENABLED && TELEMETRY_USE_WIFI
+#error "SMS_TEST_ENABLED requires cellular (TELEMETRY_USE_WIFI=0) -- there is no modem to send SMS through in WiFi mode"
+#endif
+
+#if MODEM_USB_BENCH_MODE && TELEMETRY_USE_WIFI
+#error "MODEM_USB_BENCH_MODE requires cellular (TELEMETRY_USE_WIFI=0) -- there is no modem in WiFi mode"
+#endif
 
 #if TELEMETRY_USE_WIFI
 #include <WiFi.h>
@@ -204,6 +213,31 @@ static bool ensureNetworkConnected() {
     Serial.println("[net] cellular network + PDP context up");
     return true;
 }
+
+#if SMS_TEST_ENABLED
+// Runs once, the first time the modem is registered on the network --
+// confirms the SIM/plan can send texts at all. Deliberately gated on
+// modem.isNetworkConnected() only, not ensureNetworkConnected()'s full
+// network+GPRS bar: AT+CMGS goes out over plain network registration and
+// doesn't need the PDP context that GPRS/MQTT requires.
+static void runSmsTest() {
+    static bool done = false;
+    if (done || !modem.isNetworkConnected()) return;
+    done = true;
+
+    if (!strlen(SMS_TEST_NUMBER)) {
+        Serial.println("[sms] SMS_TEST_NUMBER is empty; skipping test send");
+        return;
+    }
+
+    Serial.printf("[sms] sending test SMS to %s...\n", SMS_TEST_NUMBER);
+    if (modem.sendSMS(SMS_TEST_NUMBER, SMS_TEST_MESSAGE)) {
+        Serial.println("[sms] test SMS sent");
+    } else {
+        Serial.println("[sms] test SMS send failed");
+    }
+}
+#endif
 #endif // TELEMETRY_USE_WIFI
 
 static bool networkBearerUp() {
@@ -387,6 +421,60 @@ static void replaySpooledBatches() {
 // and logs achieved throughput against STRESS_TARGET_BPS. Blocks the net
 // task for the duration -- deliberate, so measured throughput reflects only
 // this path's own speed, not this loop's normal 50ms tick.
+// ---- Raw (uint8_t-cap-bypassing) MQTT PUBLISH framing, stress test only ---
+// PubSubClient::publish() chunks its internal write() calls to
+// MQTT_MAX_TRANSFER_SIZE (255, capped by a uint8_t inside PubSubClient
+// itself -- see platformio.ini). That's fine for real telemetry batches, but
+// it means the stress test could never measure whether bigger AT+CCHSEND/
+// AT+CIPSEND chunks actually help throughput. This builds the MQTT PUBLISH
+// packet by hand and writes it to netClient (the same already-connected
+// socket PubSubClient is using) in STRESS_RAW_CHUNK_BYTES-sized pieces
+// instead of going through PubSubClient's writer at all.
+static void mqttEncodeString(std::vector<uint8_t> &out, const char *s) {
+    uint16_t len = (uint16_t)strlen(s);
+    out.push_back((uint8_t)(len >> 8));
+    out.push_back((uint8_t)(len & 0xFF));
+    out.insert(out.end(), s, s + len);
+}
+
+static void mqttEncodeRemainingLength(std::vector<uint8_t> &out, size_t n) {
+    do {
+        uint8_t b = n % 128;
+        n /= 128;
+        if (n > 0) b |= 0x80;
+        out.push_back(b);
+    } while (n > 0);
+}
+
+// Sends one QoS-0 PUBLISH packet in <= chunkBytes pieces. Returns the number
+// of netClient.write() calls (each one AT+CCHSEND/AT+CIPSEND round-trip) it
+// took, or 0 if any write came up short.
+static uint32_t rawMqttPublish(const char *topic, const char *payload, size_t payloadLen,
+                                size_t chunkBytes) {
+    std::vector<uint8_t> varHeader;
+    mqttEncodeString(varHeader, topic);
+
+    std::vector<uint8_t> fixedHeader;
+    fixedHeader.push_back(0x30); // PUBLISH, QoS 0, no DUP/RETAIN
+    mqttEncodeRemainingLength(fixedHeader, varHeader.size() + payloadLen);
+    fixedHeader.insert(fixedHeader.end(), varHeader.begin(), varHeader.end());
+
+    uint32_t chunks = 0;
+    if (netClient.write(fixedHeader.data(), fixedHeader.size()) != fixedHeader.size()) return 0;
+    chunks++;
+
+    size_t offset = 0;
+    while (offset < payloadLen) {
+        size_t n = std::min(chunkBytes, payloadLen - offset);
+        if (netClient.write(reinterpret_cast<const uint8_t *>(payload) + offset, n) != n) {
+            return 0;
+        }
+        offset += n;
+        chunks++;
+    }
+    return chunks;
+}
+
 static void runStressTest() {
     static bool done = false;
     if (done || !mqtt.connected()) return;
@@ -408,16 +496,14 @@ static void runStressTest() {
     uint32_t windowBytes = 0;
     uint32_t totalBytes = 0;
     uint32_t seq = 0;
-    // Each mqtt.publish() call is chunked to MQTT_MAX_TRANSFER_SIZE bytes,
-    // and every chunk is one synchronous AT+CCHSEND round-trip (send AT cmd
-    // -> wait for '>' -> write bytes -> wait for the modem's confirmation)
-    // before the next chunk can start. Timing publish() itself and dividing
-    // by the chunk count it implied tells us whether that round-trip's fixed
-    // AT/modem/network turnaround dominates, or the ~22ms/chunk that raw
-    // serial transfer of 255 bytes takes at 115200 baud does -- i.e. whether
-    // raising MODEM_BAUDRATE would actually help, or whether the fix is
-    // fewer, larger chunks instead (which this PubSubClient version can't do
-    // -- see MQTT_MAX_TRANSFER_SIZE's comment in platformio.ini).
+    // Each publish is sent via rawMqttPublish(), in STRESS_RAW_CHUNK_BYTES
+    // chunks, bypassing PubSubClient's own writer (capped at 255 bytes by a
+    // uint8_t -- MQTT_MAX_TRANSFER_SIZE in platformio.ini) so this test can
+    // actually measure whether bigger AT+CCHSEND/AT+CIPSEND chunks change
+    // throughput. Timing each publish and dividing by its chunk count
+    // reveals ms/chunk at whatever STRESS_RAW_CHUNK_BYTES is set to --
+    // compare across a couple of values to see whether chunk size or a fixed
+    // per-chunk AT/modem/network round-trip cost dominates.
     uint32_t windowPublishMs = 0;
     uint32_t windowChunks = 0;
     uint64_t totalPublishMs = 0;
@@ -438,10 +524,10 @@ static void runStressTest() {
         json += "\"}";
 
         uint32_t pubStartMs = millis();
-        bool ok = mqtt.publish(MQTT_TOPIC_STRESS, json.c_str());
+        uint32_t chunks = rawMqttPublish(MQTT_TOPIC_STRESS, json.c_str(), json.length(),
+                                          STRESS_RAW_CHUNK_BYTES);
         uint32_t pubMs = millis() - pubStartMs;
-        if (ok) {
-            uint32_t chunks = (json.length() + MQTT_MAX_TRANSFER_SIZE - 1) / MQTT_MAX_TRANSFER_SIZE;
+        if (chunks > 0) {
             windowBytes += json.length();
             totalBytes += json.length();
             windowPublishMs += pubMs;
@@ -458,11 +544,11 @@ static void runStressTest() {
             uint32_t bps = (uint32_t)((uint64_t)windowBytes * 8000ULL / windowMs);
             uint32_t msPerChunkX10 =
                 windowChunks > 0 ? (uint32_t)((uint64_t)windowPublishMs * 10 / windowChunks) : 0;
-            Serial.printf("[stress] %lu bps (target %lu), %lu.%lu ms/AT+CCHSEND chunk, "
+            Serial.printf("[stress] %lu bps (target %lu), %lu.%lu ms/%d-byte chunk, "
                           "%lu bytes so far\n",
                           (unsigned long)bps, (unsigned long)STRESS_TARGET_BPS,
                           (unsigned long)(msPerChunkX10 / 10), (unsigned long)(msPerChunkX10 % 10),
-                          (unsigned long)totalBytes);
+                          (int)STRESS_RAW_CHUNK_BYTES, (unsigned long)totalBytes);
             windowBytes = 0;
             windowPublishMs = 0;
             windowChunks = 0;
@@ -479,11 +565,10 @@ static void runStressTest() {
     Serial.printf("[stress] done: %lu bytes over %lu ms, avg %lu bps (target %lu bps)\n",
                   (unsigned long)totalBytes, (unsigned long)elapsedMs,
                   (unsigned long)avgBps, (unsigned long)STRESS_TARGET_BPS);
-    Serial.printf("[stress] avg %lu.%lu ms per %d-byte AT+CCHSEND chunk over %lu chunks -- "
-                  "~22ms of that is pure serial transfer at 115200 baud; the rest is AT "
-                  "command / modem / network round-trip overhead\n",
+    Serial.printf("[stress] avg %lu.%lu ms per <=%d-byte AT+CCHSEND/CIPSEND chunk over %lu "
+                  "chunks (STRESS_RAW_CHUNK_BYTES, bypassing PubSubClient's 255-byte cap)\n",
                   (unsigned long)(avgMsPerChunkX10 / 10), (unsigned long)(avgMsPerChunkX10 % 10),
-                  (int)MQTT_MAX_TRANSFER_SIZE, (unsigned long)totalChunks);
+                  (int)STRESS_RAW_CHUNK_BYTES, (unsigned long)totalChunks);
     Serial.println("[stress] resuming normal telemetry publishing");
 }
 #endif
@@ -529,6 +614,14 @@ static void netTask(void *) {
 
 #if !TELEMETRY_USE_WIFI
     modemPowerOn();
+#if MODEM_USB_BENCH_MODE
+    Serial.println("[net] MODEM_USB_BENCH_MODE=1 -- modem is powered on and idle, "
+                    "UART1 will stay silent from here on. Drive it over its own "
+                    "USB port instead (see usb_modem_bench.py).");
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
 #endif
     mqtt.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
     mqtt.setBufferSize(MQTT_BUFFER_SIZE);
@@ -556,6 +649,10 @@ static void netTask(void *) {
             s_lastRegCheckMs = now;
             ensureNetworkConnected();
         }
+
+#if !TELEMETRY_USE_WIFI && SMS_TEST_ENABLED
+        runSmsTest(); // no-ops after its first (and only) run
+#endif
 
 #if !(TELEMETRY_USE_WIFI && WIFI_AP_MODE)
         if (now - s_lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS) {

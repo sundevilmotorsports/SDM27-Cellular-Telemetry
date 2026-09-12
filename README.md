@@ -164,6 +164,8 @@ Edit `include/telemetry_config.h`:
 | `TELEMETRY_DEVICE_ID` | Identifies this device in every batch |
 | `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES` | Batching/backpressure tuning |
 | `TELEMETRY_STRESS_TEST` | `1` = run a one-time, time-bounded uplink throughput burst after MQTT connects (see [Uplink stress test](#uplink-stress-test)); `0` = normal operation (default) |
+| `MODEM_USB_BENCH_MODE` | `1` = power the modem on and stop -- no registration/MQTT/stress test, UART1 stays silent so a PC can drive the modem directly over its own USB port (see [USB direct-to-modem bench](#usb-direct-to-modem-bench-bypassing-the-esp32-modem-uart)); `0` = normal operation (default). Cellular only. |
+| `SMS_TEST_ENABLED` | `1` = send one test SMS after the modem registers on the network, to `SMS_TEST_NUMBER` (see `include/sms_config.h`); `0` = off (default). Cellular only -- build error under `TELEMETRY_USE_WIFI=1` |
 
 CAN bitrate is in `include/can_pins.h` (`CAN_BITRATE_KBPS`, default 500
 kbit/s) -- **must match the vehicle bus you're connecting to**; body/comfort
@@ -238,11 +240,11 @@ involved.
 Set `TELEMETRY_STRESS_TEST=1` in `include/telemetry_config.h` (or via `.env`)
 to run a one-time throughput burst: once MQTT connects, the device publishes
 fixed filler payloads back-to-back on `MQTT_TOPIC_TELEMETRY/stress` for
-`STRESS_TEST_DURATION_S` (default 60s), through the same
-`mqtt.publish -> TLS -> AT+CCHSEND -> modem` path real batches use, and logs
-achieved bits/sec against `STRESS_TARGET_BPS` (default 5 Mbps, the SIM7670G's
-Cat-1 uplink spec ceiling). It runs exactly once per boot, then the device
-resumes normal telemetry publishing.
+`STRESS_TEST_DURATION_S` (default 60s), through the same TLS -> modem ->
+cellular path real batches use, and logs achieved bits/sec against
+`STRESS_TARGET_BPS` (default 5 Mbps, the SIM7670G's Cat-1 uplink spec
+ceiling). It runs exactly once per boot, then the device resumes normal
+telemetry publishing.
 
 Watch it land with the listener:
 
@@ -253,13 +255,99 @@ python3 listener.py --stress -b
 **Read this before running it on cellular:** it is designed to try to move
 tens of megabytes over `STRESS_TEST_DURATION_S`, and every byte it manages to
 push is real billed data on a metered SIM -- there is no dry-run mode. It is
-also very unlikely to get anywhere near the 5 Mbps target: `MODEM_BAUDRATE`
-(`include/board_pins.h`) is 115200 baud, i.e. ~92 Kbps raw across the
-ESP32<->modem UART, before `AT+CCHSEND` framing and `MQTT_MAX_TRANSFER_SIZE`'s
-255-byte chunking (`platformio.ini`) each take their own cut -- that UART, not
-the cellular link or MQTT/TLS, is almost certainly the bottleneck. The test's
-purpose is to measure and report the actual ceiling, not to hit the target;
-a result well under 5 Mbps is the expected finding, not a bug in the test.
+also very unlikely to get anywhere near the 5 Mbps target -- see below for
+what the real ceiling actually is and why.
+
+**What the publish is actually sent as:** it does NOT go through
+`mqtt.publish()`. `PubSubClient`'s own writer chunks every write to
+`MQTT_MAX_TRANSFER_SIZE` (255 bytes, capped by a `uint8_t` inside
+`PubSubClient` itself -- see the comment in `platformio.ini`; going over 255
+there truncates to 0 and hangs). That cap is fine for real telemetry batches,
+but it silently caps how big a single `AT+CCHSEND`/`AT+CIPSEND` chunk can be,
+which turned out to matter a lot for throughput (see measurements below). So
+the stress test instead builds the MQTT PUBLISH packet by hand
+(`rawMqttPublish()` in `net_task.cpp`) and writes it to the same already-open
+socket in `STRESS_RAW_CHUNK_BYTES`-sized pieces -- default 1400 bytes,
+just under the ~1460-1500 byte single-send cap SIMCom's AT command manual
+documents for CCHSEND/CIPSEND. Raise `STRESS_RAW_CHUNK_BYTES` further at your
+own risk -- past that cap the modem fails the send outright, it doesn't
+chunk for you.
+
+**Measured on this hardware** (T-Mobile `fast.t-mobile.com`, HiveMQ Cloud
+broker over TLS), holding everything else fixed and only changing chunk size:
+
+| Chunk size | Sustained throughput |
+|---|---|
+| 255 bytes (the old `mqtt.publish()`-chunked path) | ~50.5 Kbps |
+| 1024 bytes (`rawMqttPublish`) | ~67.9 Kbps |
+| 1400 bytes (`rawMqttPublish`, current default) | ~72.0 Kbps |
+
+So the `uint8_t` chunk cap was real and was costing a genuine ~30%+ of
+achievable throughput -- but the gain flattens out well short of the 92 Kbps
+raw-UART figure and nowhere near the 5 Mbps Cat-1 spec. That flattening
+points at the modem's own AT-command/TLS processing plus the actual cellular
+RF link as the real remaining ceiling on this SIM/carrier, not the
+ESP32<->modem UART (115200 baud, `MODEM_BAUDRATE` in `include/board_pins.h`)
+-- raising the baud rate is unlikely to move this number much further. A
+result well under 5 Mbps is the expected finding, not a bug in the test.
+
+## USB direct-to-modem bench (bypassing the ESP32<->modem UART)
+
+This board has a **second** connector for the SIM7670G's own USB interface:
+a microUSB port next to a small boot button, right on the LilyGo PCB,
+separate from the ESP32-S3's Type-C port. It's normally used for flashing
+modem firmware, but the modem also answers ordinary AT commands over it in
+normal (non-flash) operation -- which means a PC can talk to the modem
+directly, with the ESP32/UART1 out of the picture entirely.
+
+**Measured result: this was NOT faster.** At a matched 1024-byte chunk size,
+`usb_modem_bench.py` over the modem's own USB measured ~40.6 Kbps, slower
+than the same chunk size sent from the firmware over the "slow" 115200-baud
+UART (~67.9 Kbps -- see the table in [Uplink stress
+test](#uplink-stress-test)). The UART was never actually saturated at these
+rates (67.9-72 Kbps is well under its ~92 Kbps raw capacity), so replacing
+it with USB had nothing to win: the real bottleneck was the
+`uint8_t`-capped chunk size, not which physical link carried the AT
+commands. Kept below because it's still a legitimate way to test the modem
+in isolation (e.g. to rule the ESP32 firmware in or out as a suspect), just
+not a throughput win on its own.
+
+**Before connecting anything:** don't hold the boot button while plugging
+this port in unless you're deliberately entering firmware-flash mode --
+LilyGo's own issue tracker has reports of bricked modems from a mismatched
+firmware tool in that mode. If the modem doesn't answer plain `AT`, unplug
+and replug without touching the button before assuming something's wrong.
+
+1. Set `MODEM_USB_BENCH_MODE=1` in `include/telemetry_config.h` (or `.env`)
+   and reflash over the ESP32's **Type-C** port as usual. This makes the
+   firmware power the modem on and then stop -- no registration, no MQTT, no
+   stress test, and critically, no more AT traffic on UART1. **This step
+   matters**: if the old firmware is still running normally, it's already
+   driving the modem over UART1 (registering, publishing MQTT, etc.) at the
+   same time your PC would be issuing AT commands over USB -- two masters on
+   one modem will produce confusing failures, not a clean measurement.
+2. Plug the SIM7670G's microUSB port into your computer (normal mode, boot
+   button untouched).
+3. `pip3 install -r requirements.txt`, then:
+   ```
+   python3 usb_modem_bench.py --probe                          # finds the AT port
+   python3 usb_modem_bench.py --port <the port above> --duration 20
+   ```
+   This drives the same AT command sequence `net_task.cpp` uses for MQTT
+   publish (`AT+CGDCONT`/`+NETOPEN`/`+CIPOPEN`/`+CIPSEND`, or
+   `+CSSLCFG`/`+CCHSTART`/`+CCHOPEN`/`+CCHSEND` when `MQTT_USE_TLS=1`) --
+   same modem, same cellular link, same `MQTT_BROKER_HOST`/`_PORT` -- just
+   issued straight from the PC instead of relayed through UART1, and in
+   chunks up to `--chunk-size` (default 1024 bytes, well above this
+   firmware's 255-byte `MQTT_MAX_TRANSFER_SIZE` workaround) instead of the
+   firmware's 255-byte cap.
+4. Compare the printed avg bps against the firmware's own stress test result
+   at the same `--chunk-size`/`STRESS_RAW_CHUNK_BYTES`. On this hardware they
+   came out close (USB slightly slower, if anything) -- see the measured
+   numbers above.
+
+**This also spends real billed data on a metered SIM, same as the firmware
+stress test** -- there is no dry-run mode here either.
 
 ## Known limitations
 
@@ -287,11 +375,15 @@ a result well under 5 Mbps is the expected finding, not a bug in the test.
 - **CAN filter accepts everything** (`TWAI_FILTER_CONFIG_ACCEPT_ALL()`).
   Fine for a PoC observing all bus traffic; a production node would filter
   to the IDs it actually needs.
-- **~92 Kbps hard ceiling on the cellular uplink**, regardless of the
-  SIM7670G's own Cat-1 spec (~5 Mbps): `MODEM_BAUDRATE` is 115200 baud across
-  the ESP32<->modem UART, and every byte sent over cellular crosses that UART
-  via `AT+CCHSEND` first. See [Uplink stress test](#uplink-stress-test) for a
-  way to measure the real achievable number.
+- **~70 Kbps measured ceiling on the cellular uplink** on this hardware/SIM,
+  regardless of the SIM7670G's own Cat-1 spec (~5 Mbps). It is NOT the
+  ESP32<->modem UART (115200 baud, ~92 Kbps raw) -- see [Uplink stress
+  test](#uplink-stress-test) for the measurements: fixing an artificial
+  255-byte AT+CCHSEND chunk cap recovered most of the gap to the UART's raw
+  capacity, and going straight to the modem over its own USB port (bypassing
+  the UART entirely) didn't beat it either. What's left points at the
+  modem's own AT/TLS processing and the real cellular RF link on this
+  carrier/SIM, not any one link in the ESP32's own pipeline.
 - **WiFi mode (`TELEMETRY_USE_WIFI=1`) is a bench-testing convenience**, not
   the deployment target -- it lets you prove the batch/MQTT/spool pipeline
   without a SIM card. It supports WPA2/WPA3-Personal and -Enterprise
