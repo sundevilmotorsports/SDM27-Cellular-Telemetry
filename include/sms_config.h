@@ -28,5 +28,5 @@
 #endif
 
 #ifndef SMS_TEST_MESSAGE
-#define SMS_TEST_MESSAGE "ESP32 telemetry: SMS test OK"
+#define SMS_TEST_MESSAGE "Whats up Evan. This is from SDM27 Telemetry"
 #endif
