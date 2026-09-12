@@ -67,6 +67,14 @@
 // without needing an unrealistic CAN frame rate. Must comfortably fit under
 // MQTT_BUFFER_SIZE together with that header -- default headroom is ~4KB.
 #define STRESS_FILLER_BYTES 4096
+// Bypasses PubSubClient's own chunked writer (capped at MQTT_MAX_TRANSFER_SIZE
+// = 255 by its internal uint8_t -- see platformio.ini) for this test only:
+// the stress test builds its own MQTT PUBLISH frame and writes it to netClient
+// in chunks of this size directly, so it can actually test whether bigger
+// AT+CCHSEND/AT+CIPSEND chunks change throughput. Keep this under ~1460 bytes
+// -- SIMCom's AT command manual caps a single CCHSEND/CIPSEND payload there;
+// going over it fails the send rather than silently chunking further.
+#define STRESS_RAW_CHUNK_BYTES 1400
 // Hard cap on how long the burst runs before it stops and prints a summary,
 // so a run left connected can't keep burning metered data indefinitely.
 // Runs once per boot; power-cycle or reflash to run it again.
