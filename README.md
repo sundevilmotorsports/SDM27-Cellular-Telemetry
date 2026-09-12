@@ -164,6 +164,7 @@ Edit `include/telemetry_config.h`:
 | `TELEMETRY_DEVICE_ID` | Identifies this device in every batch |
 | `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES` | Batching/backpressure tuning |
 | `TELEMETRY_STRESS_TEST` | `1` = run a one-time, time-bounded uplink throughput burst after MQTT connects (see [Uplink stress test](#uplink-stress-test)); `0` = normal operation (default) |
+| `SMS_TEST_ENABLED` | `1` = send one test SMS after the modem registers on the network, to `SMS_TEST_NUMBER` (see `include/sms_config.h`); `0` = off (default). Cellular only -- build error under `TELEMETRY_USE_WIFI=1` |
 
 CAN bitrate is in `include/can_pins.h` (`CAN_BITRATE_KBPS`, default 500
 kbit/s) -- **must match the vehicle bus you're connecting to**; body/comfort
