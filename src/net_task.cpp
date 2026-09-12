@@ -1,6 +1,7 @@
 #include "net_task.h"
 #include "board_pins.h"
 #include "telemetry_config.h"
+#include "sms_config.h"
 #include "telemetry_format.h"
 #include "time_sync.h"
 #include "can_handler.h"
@@ -10,6 +11,10 @@
 #include <Arduino.h>
 #include <algorithm>
 #include <vector>
+
+#if SMS_TEST_ENABLED && TELEMETRY_USE_WIFI
+#error "SMS_TEST_ENABLED requires cellular (TELEMETRY_USE_WIFI=0) -- there is no modem to send SMS through in WiFi mode"
+#endif
 
 #if TELEMETRY_USE_WIFI
 #include <WiFi.h>
@@ -204,6 +209,31 @@ static bool ensureNetworkConnected() {
     Serial.println("[net] cellular network + PDP context up");
     return true;
 }
+
+#if SMS_TEST_ENABLED
+// Runs once, the first time the modem is registered on the network --
+// confirms the SIM/plan can send texts at all. Deliberately gated on
+// modem.isNetworkConnected() only, not ensureNetworkConnected()'s full
+// network+GPRS bar: AT+CMGS goes out over plain network registration and
+// doesn't need the PDP context that GPRS/MQTT requires.
+static void runSmsTest() {
+    static bool done = false;
+    if (done || !modem.isNetworkConnected()) return;
+    done = true;
+
+    if (!strlen(SMS_TEST_NUMBER)) {
+        Serial.println("[sms] SMS_TEST_NUMBER is empty; skipping test send");
+        return;
+    }
+
+    Serial.printf("[sms] sending test SMS to %s...\n", SMS_TEST_NUMBER);
+    if (modem.sendSMS(SMS_TEST_NUMBER, SMS_TEST_MESSAGE)) {
+        Serial.println("[sms] test SMS sent");
+    } else {
+        Serial.println("[sms] test SMS send failed");
+    }
+}
+#endif
 #endif // TELEMETRY_USE_WIFI
 
 static bool networkBearerUp() {
@@ -556,6 +586,10 @@ static void netTask(void *) {
             s_lastRegCheckMs = now;
             ensureNetworkConnected();
         }
+
+#if !TELEMETRY_USE_WIFI && SMS_TEST_ENABLED
+        runSmsTest(); // no-ops after its first (and only) run
+#endif
 
 #if !(TELEMETRY_USE_WIFI && WIFI_AP_MODE)
         if (now - s_lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS) {
