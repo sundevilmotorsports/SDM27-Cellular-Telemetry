@@ -149,6 +149,29 @@ static void modemPowerOn() {
     modem.init();
     Serial.print("[net] modem info: ");
     Serial.println(modem.getModemInfo());
+
+    // ---- UART baud upgrade --------------------------------------------------
+    // The modem boots at MODEM_BAUDRATE (115200). Tell it to switch to
+    // MODEM_TARGET_BAUDRATE via AT+IPR, then reconfigure the ESP32's UART to
+    // match. If the handshake fails at the new speed, fall back silently --
+    // everything still works, just slower.
+#if MODEM_TARGET_BAUDRATE != MODEM_BAUDRATE
+    Serial.printf("[net] upgrading UART baud %d -> %d...\n",
+                  MODEM_BAUDRATE, MODEM_TARGET_BAUDRATE);
+    modem.sendAT("+IPR=", MODEM_TARGET_BAUDRATE);
+    delay(100); // give the modem time to reconfigure its UART
+    SerialAT.updateBaudRate(MODEM_TARGET_BAUDRATE);
+    delay(100);
+    if (modem.testAT(3000)) {
+        Serial.printf("[net] UART running at %d baud\n", MODEM_TARGET_BAUDRATE);
+    } else {
+        Serial.printf("[net] modem did not respond at %d baud, reverting to %d\n",
+                      MODEM_TARGET_BAUDRATE, MODEM_BAUDRATE);
+        SerialAT.updateBaudRate(MODEM_BAUDRATE);
+        modem.sendAT("+IPR=", MODEM_BAUDRATE);
+        delay(100);
+    }
+#endif
 }
 
 // Prints the modem state that actually explains a registration failure. Without
@@ -343,6 +366,63 @@ static void spoolBatch(const String &json) {
     Serial.printf("[net] spooled batch to %s\n", path);
 }
 
+// ---- Raw (PubSubClient-bypassing) MQTT PUBLISH framing --------------------
+// PubSubClient::publish() chunks its internal write() calls to
+// MQTT_MAX_TRANSFER_SIZE (255, capped by a uint8_t inside PubSubClient itself
+// -- see platformio.ini). Each chunk is a separate AT+CCHSEND/AT+CIPSEND
+// round-trip to the modem (~30-50ms each), so a 4KB batch becomes ~16 round-
+// trips. This builds the MQTT PUBLISH packet by hand and writes it to
+// netClient in RAW_PUBLISH_CHUNK_BYTES-sized pieces, cutting the number of
+// modem round-trips ~6x. Used by both real publishes and the stress test.
+//
+// Keep RAW_PUBLISH_CHUNK_BYTES <= ~1460: SIMCom's AT command manual caps a
+// single CCHSEND/CIPSEND payload at the TCP MSS; larger sends are rejected.
+#define RAW_PUBLISH_CHUNK_BYTES 1400
+static void mqttEncodeString(std::vector<uint8_t> &out, const char *s) {
+    uint16_t len = (uint16_t)strlen(s);
+    out.push_back((uint8_t)(len >> 8));
+    out.push_back((uint8_t)(len & 0xFF));
+    out.insert(out.end(), s, s + len);
+}
+
+static void mqttEncodeRemainingLength(std::vector<uint8_t> &out, size_t n) {
+    do {
+        uint8_t b = n % 128;
+        n /= 128;
+        if (n > 0) b |= 0x80;
+        out.push_back(b);
+    } while (n > 0);
+}
+
+// Sends one QoS-0 PUBLISH packet in <= chunkBytes pieces. Returns the number
+// of netClient.write() calls (each one AT+CCHSEND/AT+CIPSEND round-trip) it
+// took, or 0 if any write came up short.
+static uint32_t rawMqttPublish(const char *topic, const char *payload, size_t payloadLen,
+                                size_t chunkBytes) {
+    std::vector<uint8_t> varHeader;
+    mqttEncodeString(varHeader, topic);
+
+    std::vector<uint8_t> fixedHeader;
+    fixedHeader.push_back(0x30); // PUBLISH, QoS 0, no DUP/RETAIN
+    mqttEncodeRemainingLength(fixedHeader, varHeader.size() + payloadLen);
+    fixedHeader.insert(fixedHeader.end(), varHeader.begin(), varHeader.end());
+
+    uint32_t chunks = 0;
+    if (netClient.write(fixedHeader.data(), fixedHeader.size()) != fixedHeader.size()) return 0;
+    chunks++;
+
+    size_t offset = 0;
+    while (offset < payloadLen) {
+        size_t n = std::min(chunkBytes, payloadLen - offset);
+        if (netClient.write(reinterpret_cast<const uint8_t *>(payload) + offset, n) != n) {
+            return 0;
+        }
+        offset += n;
+        chunks++;
+    }
+    return chunks;
+}
+
 // Replays a bounded number of spooled batches per call so this never starves
 // live traffic if a large backlog has built up.
 //
@@ -392,7 +472,8 @@ static void replaySpooledBatches() {
             continue;
         }
 
-        if (mqtt.publish(MQTT_TOPIC_TELEMETRY, payload.c_str())) {
+        if (rawMqttPublish(MQTT_TOPIC_TELEMETRY, payload.c_str(), payload.length(),
+                          RAW_PUBLISH_CHUNK_BYTES) > 0) {
             LittleFS.remove(path);
             replayed++;
             s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
@@ -413,68 +494,9 @@ static void replaySpooledBatches() {
     }
 }
 
+
 // ---- Uplink stress test ---------------------------------------------------
 #if TELEMETRY_STRESS_TEST
-// Runs once, the first time MQTT is connected after boot: publishes fixed
-// filler payloads back-to-back for STRESS_TEST_DURATION_S, through the same
-// mqtt.publish() -> PubSubClient -> TLS -> AT+CCHSEND path real batches use,
-// and logs achieved throughput against STRESS_TARGET_BPS. Blocks the net
-// task for the duration -- deliberate, so measured throughput reflects only
-// this path's own speed, not this loop's normal 50ms tick.
-// ---- Raw (uint8_t-cap-bypassing) MQTT PUBLISH framing, stress test only ---
-// PubSubClient::publish() chunks its internal write() calls to
-// MQTT_MAX_TRANSFER_SIZE (255, capped by a uint8_t inside PubSubClient
-// itself -- see platformio.ini). That's fine for real telemetry batches, but
-// it means the stress test could never measure whether bigger AT+CCHSEND/
-// AT+CIPSEND chunks actually help throughput. This builds the MQTT PUBLISH
-// packet by hand and writes it to netClient (the same already-connected
-// socket PubSubClient is using) in STRESS_RAW_CHUNK_BYTES-sized pieces
-// instead of going through PubSubClient's writer at all.
-static void mqttEncodeString(std::vector<uint8_t> &out, const char *s) {
-    uint16_t len = (uint16_t)strlen(s);
-    out.push_back((uint8_t)(len >> 8));
-    out.push_back((uint8_t)(len & 0xFF));
-    out.insert(out.end(), s, s + len);
-}
-
-static void mqttEncodeRemainingLength(std::vector<uint8_t> &out, size_t n) {
-    do {
-        uint8_t b = n % 128;
-        n /= 128;
-        if (n > 0) b |= 0x80;
-        out.push_back(b);
-    } while (n > 0);
-}
-
-// Sends one QoS-0 PUBLISH packet in <= chunkBytes pieces. Returns the number
-// of netClient.write() calls (each one AT+CCHSEND/AT+CIPSEND round-trip) it
-// took, or 0 if any write came up short.
-static uint32_t rawMqttPublish(const char *topic, const char *payload, size_t payloadLen,
-                                size_t chunkBytes) {
-    std::vector<uint8_t> varHeader;
-    mqttEncodeString(varHeader, topic);
-
-    std::vector<uint8_t> fixedHeader;
-    fixedHeader.push_back(0x30); // PUBLISH, QoS 0, no DUP/RETAIN
-    mqttEncodeRemainingLength(fixedHeader, varHeader.size() + payloadLen);
-    fixedHeader.insert(fixedHeader.end(), varHeader.begin(), varHeader.end());
-
-    uint32_t chunks = 0;
-    if (netClient.write(fixedHeader.data(), fixedHeader.size()) != fixedHeader.size()) return 0;
-    chunks++;
-
-    size_t offset = 0;
-    while (offset < payloadLen) {
-        size_t n = std::min(chunkBytes, payloadLen - offset);
-        if (netClient.write(reinterpret_cast<const uint8_t *>(payload) + offset, n) != n) {
-            return 0;
-        }
-        offset += n;
-        chunks++;
-    }
-    return chunks;
-}
-
 static void runStressTest() {
     static bool done = false;
     if (done || !mqtt.connected()) return;
@@ -525,7 +547,7 @@ static void runStressTest() {
 
         uint32_t pubStartMs = millis();
         uint32_t chunks = rawMqttPublish(MQTT_TOPIC_STRESS, json.c_str(), json.length(),
-                                          STRESS_RAW_CHUNK_BYTES);
+                                          RAW_PUBLISH_CHUNK_BYTES);
         uint32_t pubMs = millis() - pubStartMs;
         if (chunks > 0) {
             windowBytes += json.length();
@@ -548,7 +570,7 @@ static void runStressTest() {
                           "%lu bytes so far\n",
                           (unsigned long)bps, (unsigned long)STRESS_TARGET_BPS,
                           (unsigned long)(msPerChunkX10 / 10), (unsigned long)(msPerChunkX10 % 10),
-                          (int)STRESS_RAW_CHUNK_BYTES, (unsigned long)totalBytes);
+                          (int)RAW_PUBLISH_CHUNK_BYTES, (unsigned long)totalBytes);
             windowBytes = 0;
             windowPublishMs = 0;
             windowChunks = 0;
@@ -566,9 +588,9 @@ static void runStressTest() {
                   (unsigned long)totalBytes, (unsigned long)elapsedMs,
                   (unsigned long)avgBps, (unsigned long)STRESS_TARGET_BPS);
     Serial.printf("[stress] avg %lu.%lu ms per <=%d-byte AT+CCHSEND/CIPSEND chunk over %lu "
-                  "chunks (STRESS_RAW_CHUNK_BYTES, bypassing PubSubClient's 255-byte cap)\n",
+                  "chunks (RAW_PUBLISH_CHUNK_BYTES, bypassing PubSubClient's 255-byte cap)\n",
                   (unsigned long)(avgMsPerChunkX10 / 10), (unsigned long)(avgMsPerChunkX10 % 10),
-                  (int)STRESS_RAW_CHUNK_BYTES, (unsigned long)totalChunks);
+                  (int)RAW_PUBLISH_CHUNK_BYTES, (unsigned long)totalChunks);
     Serial.println("[stress] resuming normal telemetry publishing");
 }
 #endif
@@ -591,7 +613,9 @@ static void drainAndPublish() {
 
     String json = telemetryFormatBatch(batch, TELEMETRY_DEVICE_ID, timeSyncEpochMsFor);
 
-    if (mqtt.connected() && mqtt.publish(MQTT_TOPIC_TELEMETRY, json.c_str())) {
+    if (mqtt.connected() &&
+        rawMqttPublish(MQTT_TOPIC_TELEMETRY, json.c_str(), json.length(),
+                       RAW_PUBLISH_CHUNK_BYTES) > 0) {
         Serial.printf("[net] published batch seq=%lu frames=%u dropped=%u\n",
                       (unsigned long)batch.seq, (unsigned)batch.frames.size(),
                       (unsigned)batch.dropped_frames);
