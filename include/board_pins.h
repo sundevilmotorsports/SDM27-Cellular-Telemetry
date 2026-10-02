@@ -18,6 +18,7 @@
 #pragma once
 
 #define MODEM_BAUDRATE      115200
+#define MODEM_TARGET_BAUDRATE 921600  // upgraded via AT+IPR after init; see modemPowerOn()
 #define MODEM_DTR_PIN       9
 #define MODEM_TX_PIN        11   // ESP32 UART1 TX -> modem RXD
 #define MODEM_RX_PIN        10   // ESP32 UART1 RX <- modem TXD

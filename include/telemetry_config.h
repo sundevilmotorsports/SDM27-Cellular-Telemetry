@@ -47,15 +47,14 @@
 // below -- but it will still spend whatever it manages to push, and that is
 // real billed data, not a simulation.
 //
-// The likely actual ceiling: MODEM_BAUDRATE (board_pins.h) is 115200 baud,
-// i.e. ~11.5 KB/s (~92 Kbps) raw across the ESP32<->modem UART -- before
-// AT+CCHSEND command framing and MQTT_MAX_TRANSFER_SIZE's 255-byte chunking
-// (platformio.ini) each take their own cut. That UART link, not the
-// cellular RF link, a Cat-1 modem's ~5 Mbps spec, or MQTT/TLS, is almost
-// certainly the bottleneck -- 5 Mbps is ~50x what 115200 baud can carry no
-// matter what runs on top of it. This test exists to measure and report the
-// real number, not to force the target; do not read a result well under 5
-// Mbps as a bug.
+// The likely actual ceiling: MODEM_TARGET_BAUDRATE (board_pins.h) is 921600
+// baud, i.e. ~92 KB/s (~740 Kbps) raw across the ESP32<->modem UART, but
+// AT+CCHSEND round-trip overhead (~30-50ms per chunk) limits usable throughput
+// to roughly 200-250 Kbps even with RAW_PUBLISH_CHUNK_BYTES = 1400 (bypassing
+// PubSubClient's 255-byte cap). That UART link, not the cellular RF, the
+// Cat-1 modem's ~5 Mbps spec, or MQTT/TLS, is almost certainly the bottleneck.
+// This test exists to measure and report the real number, not to force the
+// target; do not read a result well under 5 Mbps as a bug.
 #ifndef TELEMETRY_STRESS_TEST
 #define TELEMETRY_STRESS_TEST 0
 #endif
@@ -67,14 +66,10 @@
 // without needing an unrealistic CAN frame rate. Must comfortably fit under
 // MQTT_BUFFER_SIZE together with that header -- default headroom is ~4KB.
 #define STRESS_FILLER_BYTES 4096
-// Bypasses PubSubClient's own chunked writer (capped at MQTT_MAX_TRANSFER_SIZE
-// = 255 by its internal uint8_t -- see platformio.ini) for this test only:
-// the stress test builds its own MQTT PUBLISH frame and writes it to netClient
-// in chunks of this size directly, so it can actually test whether bigger
-// AT+CCHSEND/AT+CIPSEND chunks change throughput. Keep this under ~1460 bytes
-// -- SIMCom's AT command manual caps a single CCHSEND/CIPSEND payload there;
-// going over it fails the send rather than silently chunking further.
-#define STRESS_RAW_CHUNK_BYTES 1400
+// RAW_PUBLISH_CHUNK_BYTES (defined in net_task.cpp) controls the chunk size
+// for all MQTT publishes, including the stress test. The stress test
+// previously had its own STRESS_RAW_CHUNK_BYTES here, but now shares the
+// same constant with real telemetry publishes.
 // Hard cap on how long the burst runs before it stops and prints a summary,
 // so a run left connected can't keep burning metered data indefinitely.
 // Runs once per boot; power-cycle or reflash to run it again.
@@ -93,7 +88,7 @@
 //     usb_modem_bench.py. The point is measuring throughput without the
 //     ESP32<->modem UART1 link (115200 baud, see MODEM_BAUDRATE) in the path
 //     at all, instead of through AT+CCHSEND/AT+CIPSEND issued by this
-//     firmware.
+//     firmware over UART1 (MODEM_TARGET_BAUDRATE, see board_pins.h).
 // 0 = off (default) -- normal operation.
 // Cellular only, same reasoning as SMS_TEST_ENABLED -- build error under
 // TELEMETRY_USE_WIFI=1 (see the check in net_task.cpp).
