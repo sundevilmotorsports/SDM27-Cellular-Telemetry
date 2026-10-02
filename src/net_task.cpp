@@ -591,6 +591,22 @@ static void runStressTest() {
                   "chunks (RAW_PUBLISH_CHUNK_BYTES, bypassing PubSubClient's 255-byte cap)\n",
                   (unsigned long)(avgMsPerChunkX10 / 10), (unsigned long)(avgMsPerChunkX10 % 10),
                   (int)RAW_PUBLISH_CHUNK_BYTES, (unsigned long)totalChunks);
+
+    // Publish the final summary report over MQTT so it displays directly in the listener terminal
+    String summaryJson = "{\"stress_summary\":true,\"total_bytes\":";
+    summaryJson += totalBytes;
+    summaryJson += ",\"duration_ms\":";
+    summaryJson += elapsedMs;
+    summaryJson += ",\"avg_bps\":";
+    summaryJson += avgBps;
+    summaryJson += ",\"avg_kbps\":";
+    summaryJson += (avgBps / 1000);
+    summaryJson += ",\"ms_per_chunk\":";
+    summaryJson += (avgMsPerChunkX10 / 10);
+    summaryJson += "}";
+    rawMqttPublish(MQTT_TOPIC_STRESS, summaryJson.c_str(), summaryJson.length(),
+                   RAW_PUBLISH_CHUNK_BYTES);
+
     Serial.println("[stress] resuming normal telemetry publishing");
 }
 #endif

@@ -167,7 +167,12 @@ def on_message(client, userdata, msg):
         import json
         try:
             parsed = json.loads(payload.decode("utf-8"))
-            if "stress_seq" in parsed:
+            if "stress_summary" in parsed:
+                print(f"\n{'='*70}")
+                print(f"[{timestamp}] ★ STRESS TEST RESULT: {parsed.get('avg_kbps', 0)} kbps ({parsed.get('avg_bps', 0)} bps)")
+                print(f"              {parsed.get('total_bytes', 0)} bytes over {parsed.get('duration_ms', 0)} ms (~{parsed.get('ms_per_chunk', 0)} ms/chunk)")
+                print(f"{'='*70}\n")
+            elif "stress_seq" in parsed:
                 print(f"[{timestamp}] #{current_num:04d} {topic} [stress seq={parsed['stress_seq']}] ({length}B, {data_totals})")
             else:
                 seq = parsed.get("seq", "-")
@@ -179,6 +184,20 @@ def on_message(client, userdata, msg):
             text = text_repr or f"{length} bytes"
             print(f"[{timestamp}] #{current_num:04d} {topic} ({text})")
         return
+
+    import json
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+        if "stress_summary" in parsed:
+            print(f"\n{'='*70}")
+            print(f"[{timestamp}] ★ STRESS TEST COMPLETED!")
+            print(f"  Speed       : {parsed.get('avg_kbps', 0)} kbps ({parsed.get('avg_bps', 0)} bps)")
+            print(f"  Data Moved  : {parsed.get('total_bytes', 0)} bytes in {parsed.get('duration_ms', 0)} ms")
+            print(f"  Packet Time : ~{parsed.get('ms_per_chunk', 0)} ms per 1400B chunk")
+            print(f"{'='*70}\n")
+            return
+    except Exception:
+        pass
 
     print(f"\n--- [MESSAGE #{current_num}] {timestamp} ---")
     print(f"  Topic   : {topic}")
