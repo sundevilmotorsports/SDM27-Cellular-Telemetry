@@ -73,7 +73,7 @@
 // Hard cap on how long the burst runs before it stops and prints a summary,
 // so a run left connected can't keep burning metered data indefinitely.
 // Runs once per boot; power-cycle or reflash to run it again.
-#define STRESS_TEST_DURATION_S 60
+#define STRESS_TEST_DURATION_S 10
 // How often to log the throughput measured so far while the burst runs.
 #define STRESS_LOG_INTERVAL_MS 1000
 // MQTT_TOPIC_STRESS (derived from MQTT_TOPIC_TELEMETRY) is defined down in
