@@ -28,6 +28,8 @@ static WiFiClient netClient;
 // in mbedTLS, so a publish is one socket write instead of one AT+CCHSEND /
 // AT+CIPSEND round-trip per ~1.4KB chunk.
 #include <PPP.h>
+#include <esp_netif_ppp.h>
+#include <esp_modem_api.h>
 static HardwareSerial &SerialAT = Serial1;
 #if MQTT_USE_TLS
 #include <NetworkClientSecure.h>
@@ -262,6 +264,88 @@ static void logModemDiagnostics() {
 static bool s_pppStarted = false;
 static bool s_sntpStarted = false;
 
+// +CGCONTRDP prints addresses as dot-separated decimal bytes: 4 for IPv4,
+// 16 for IPv6.
+static bool parseModemAddr(const String &s, esp_ip_addr_t &out) {
+    uint8_t b[16];
+    int n = 0;
+    const char *p = s.c_str();
+    while (n < 16) {
+        char *end;
+        long v = strtol(p, &end, 10);
+        if (end == p || v < 0 || v > 255) return false;
+        b[n++] = (uint8_t)v;
+        p = end;
+        if (*p != '.') break;
+        p++;
+    }
+    if (*p) return false;
+    memset(&out, 0, sizeof(out));
+    if (n == 4) {
+        out.type = ESP_IPADDR_TYPE_V4;
+        memcpy(&out.u_addr.ip4.addr, b, 4);
+        return true;
+    }
+    if (n == 16) {
+        out.type = ESP_IPADDR_TYPE_V6;
+        memcpy(out.u_addr.ip6.addr, b, 16);
+        return true;
+    }
+    return false;
+}
+
+// lwIP only learns DNS servers over PPP from IPCP, which never completes on an
+// IPv6-only context. Take the carrier's servers from the modem instead: on
+// T-Mobile they are DNS64, so IPv4-only hosts like the broker come back as
+// NAT64 addresses reachable over IPv6.
+static void configureDnsFromModem() {
+    String r = PPP.cmd("AT+CGCONTRDP=1", 2000);
+    // +CGCONTRDP: <cid>,<bearer>,"<apn>","<addr mask>","<gw>","<dns1>","<dns2>",...
+    std::vector<String> quoted;
+    int line = r.indexOf("+CGCONTRDP:");
+    int lineEnd = line >= 0 ? r.indexOf('\n', line) : -1;
+    String first = line >= 0 ? r.substring(line, lineEnd >= 0 ? lineEnd : r.length()) : "";
+    for (int q = first.indexOf('"'); q >= 0;) {
+        int e = first.indexOf('"', q + 1);
+        if (e < 0) break;
+        quoted.push_back(first.substring(q + 1, e));
+        q = first.indexOf('"', e + 1);
+    }
+
+    int set = 0;
+    for (size_t i = 3; i < quoted.size() && set < 2; i++) {
+        esp_netif_dns_info_t dns;
+        if (!parseModemAddr(quoted[i], dns.ip)) continue;
+        esp_netif_set_dns_info(PPP.netif(), set == 0 ? ESP_NETIF_DNS_MAIN : ESP_NETIF_DNS_BACKUP, &dns);
+        Serial.printf("[net] DNS %d from modem: %s\n", set + 1, quoted[i].c_str());
+        set++;
+    }
+    if (set == 0) {
+        // Google's public DNS64, used only if the modem reports nothing.
+        esp_netif_dns_info_t dns = {};
+        dns.ip.type = ESP_IPADDR_TYPE_V6;
+        const uint8_t g[16] = {0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x64, 0x64};
+        memcpy(dns.ip.u_addr.ip6.addr, g, 16);
+        esp_netif_set_dns_info(PPP.netif(), ESP_NETIF_DNS_MAIN, &dns);
+        Serial.println("[net] modem reported no DNS; using 2001:4860:4860::6464");
+    }
+}
+
+// lwIP's SNTP resolves names IPv4-first, which fails on an IPv6-only link.
+// Network.hostByName() prefers AAAA once a global IPv6 exists, so resolve
+// here and hand SNTP a literal address.
+static void startSntp() {
+    static char ntpAddr[48]; // SNTP keeps the pointer
+    IPAddress ip;
+    if (!Network.hostByName("pool.ntp.org", ip)) {
+        Serial.println("[net] could not resolve pool.ntp.org; will retry");
+        return;
+    }
+    strlcpy(ntpAddr, ip.toString().c_str(), sizeof(ntpAddr));
+    configTime(0, 0, ntpAddr);
+    s_sntpStarted = true;
+}
+
 static bool pppStart() {
     uint32_t baud = modemUartHandshake();
     if (baud == 0) return false;
@@ -275,6 +359,17 @@ static bool pppStart() {
     }
     Serial.printf("[net] modem: %s, IMEI %s\n", PPP.moduleName().c_str(), PPP.IMEI().c_str());
 
+    // Off by default in esp-netif; without them a failed PPP negotiation
+    // shows up only as "no IP", with no hint which phase died.
+    esp_netif_ppp_config_t pppCfg = {};
+    pppCfg.ppp_phase_event_enabled = true;
+    pppCfg.ppp_error_event_enabled = true;
+    esp_netif_ppp_set_params(PPP.netif(), &pppCfg);
+
+    esp_modem_PdpContext_t pdp = {1, PPP_PDP_TYPE, TELEMETRY_APN};
+    if (esp_modem_set_pdp_context(PPP.handle(), &pdp) != ESP_OK) {
+        Serial.printf("[net] modem rejected PDP type %s\n", PPP_PDP_TYPE);
+    }
     return true;
 }
 
@@ -313,13 +408,26 @@ static bool ensureNetworkConnected() {
     }
     if (!PPP.waitStatusBits(ESP_NETIF_CONNECTED_BIT, PPP_CONNECT_TIMEOUT_MS)) {
         Serial.println("[net] PPP did not get an IP address");
+        // CMUX keeps an AT channel open, so the modem can say why the PDP
+        // context behind the PPP session didn't come up.
+        for (const char *at : {"AT+CGDCONT?", "AT+CGACT?", "AT+CGPADDR", "AT+CEER"}) {
+            String r = PPP.cmd(at, 2000);
+            r.trim();
+            r.replace("\r\n", " | ");
+            Serial.printf("[net]   %s -> %s\n", at, r.c_str());
+        }
         return false;
     }
-    Serial.printf("[net] PPP up, IP %s\n", PPP.localIP().toString().c_str());
-    if (!s_sntpStarted) {
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-        s_sntpStarted = true;
+    // IPv6 global addresses arrive by router advertisement after the link is up.
+    if (!PPP.waitStatusBits(ESP_NETIF_HAS_IP_BIT | ESP_NETIF_HAS_GLOBAL_IP6_BIT, 15000)) {
+        Serial.println("[net] PPP link up but no routable address arrived");
+        return false;
     }
+    configureDnsFromModem();
+    String addr = PPP.hasIP() ? "IPv4 " + PPP.localIP().toString()
+                              : "IPv6 " + PPP.globalIPv6().toString();
+    Serial.printf("[net] PPP up, %s\n", addr.c_str());
+    if (!s_sntpStarted) startSntp();
     return true;
 }
 
@@ -747,6 +855,9 @@ static void netTask(void *) {
 #if !(TELEMETRY_USE_WIFI && WIFI_AP_MODE)
         if (now - s_lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS) {
             s_lastTimeSyncMs = now;
+#if !TELEMETRY_USE_WIFI
+            if (!s_sntpStarted && PPP.connected()) startSntp();
+#endif
             if (!g_timeSync.syncFromSystemClock()) {
                 Serial.println("[net] periodic time sync failed");
             }

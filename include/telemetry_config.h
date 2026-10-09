@@ -162,6 +162,12 @@
 // standard 3GPP commands; PPP_MODEM_SIM7600 is the closest SIMCom-specific
 // profile if GENERIC misbehaves on the SIM7670G.
 #define PPP_MODEM_MODEL PPP_MODEM_GENERIC
+// PDP context type requested for the PPP session. T-Mobile gives this SIM an
+// IPv6-only context whatever is asked for; PPP then runs over IPV6CP (enabled
+// via custom_sdkconfig in platformio.ini) and reaches IPv4 hosts via NAT64.
+#ifndef PPP_PDP_TYPE
+#define PPP_PDP_TYPE "IPV4V6"
+#endif
 // How long to wait for an IP once the modem has switched to PPP data mode.
 #define PPP_CONNECT_TIMEOUT_MS 30000
 
