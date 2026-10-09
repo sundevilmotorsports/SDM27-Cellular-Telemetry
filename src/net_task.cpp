@@ -24,17 +24,17 @@
 #include <WiFi.h>
 static WiFiClient netClient;
 #else
-#include "gsm_modem.h"
+// The modem is only a PPP bearer: TCP runs in the ESP32's lwIP stack and TLS
+// in mbedTLS, so a publish is one socket write instead of one AT+CCHSEND /
+// AT+CIPSEND round-trip per ~1.4KB chunk.
+#include <PPP.h>
 static HardwareSerial &SerialAT = Serial1;
-static TinyGsm modem(SerialAT);
 #if MQTT_USE_TLS
-// TLS runs over the modem's +CCH SSL channel rather than a TCP socket. SNI is
-// enabled by the driver, which multi-tenant brokers like HiveMQ Cloud require
-// to route to the right cluster. Certificate validation is off -- see
-// MQTT_USE_TLS in telemetry_config.h.
-static TinyGsmClientSecure netClient(modem);
+#include <NetworkClientSecure.h>
+static NetworkClientSecure netClient;
 #else
-static TinyGsmClient netClient(modem);
+#include <NetworkClient.h>
+static NetworkClient netClient;
 #endif
 #endif
 
@@ -118,10 +118,9 @@ static bool ensureNetworkConnected() {
 #else
 // ---- Modem power-on -----------------------------------------------------
 // Sequence transcribed from LilyGo's ATdebug example (examples/ATdebug/ATdebug.ino)
-// for TINY_GSM_MODEM_SIM7670G: reset pulse, DTR low, then a PWRKEY pulse.
-static void modemPowerOn() {
-    SerialAT.begin(MODEM_BAUDRATE, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
-
+// for the SIM7670G: reset pulse, DTR low, then a PWRKEY pulse. Also used to
+// recover a wedged PPP session: the reset pulse drops the modem out of CMUX.
+static void modemPowerPins() {
     pinMode(BOARD_LED_PIN, OUTPUT);
     digitalWrite(BOARD_LED_PIN, !LED_ON);
 
@@ -141,37 +140,81 @@ static void modemPowerOn() {
     digitalWrite(BOARD_PWRKEY_PIN, HIGH);
     delay(MODEM_POWERON_PULSE_WIDTH_MS);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
+}
 
+// Minimal AT exchange on Serial1, used only before PPP owns the UART.
+static bool rawAt(const char *cmd, uint32_t timeoutMs) {
+    while (SerialAT.available()) SerialAT.read();
+    SerialAT.print(cmd);
+    SerialAT.print("\r");
+    String resp;
+    uint32_t start = millis();
+    while (millis() - start < timeoutMs) {
+        while (SerialAT.available()) {
+            resp += (char)SerialAT.read();
+            if (resp.endsWith("OK\r\n")) return true;
+            if (resp.endsWith("ERROR\r\n")) return false;
+        }
+        delay(2);
+    }
+    return false;
+}
+
+static bool probeAt(uint32_t baud, uint32_t timeoutMs) {
+    SerialAT.updateBaudRate(baud);
+    uint32_t start = millis();
+    while (millis() - start < timeoutMs) {
+        if (rawAt("AT", 300)) return true;
+    }
+    return false;
+}
+
+// A cold SIM7670G takes several seconds to answer AT. Both rates are tried
+// because SIMCom modems may persist AT+IPR across resets.
+static uint32_t detectModemBaud(uint32_t timeoutMs) {
+    const uint32_t bauds[] = {MODEM_BAUDRATE, MODEM_TARGET_BAUDRATE};
+    uint32_t start = millis();
+    while (millis() - start < timeoutMs) {
+        for (uint32_t b : bauds) {
+            if (probeAt(b, 300)) return b;
+        }
+    }
+    return 0;
+}
+
+// Gets the modem talking at MODEM_TARGET_BAUDRATE if it can and returns the
+// baud it ended up at, or 0 if it never answered. The baud is the hard ceiling
+// on throughput under PPP, so this matters more than it did over AT sockets.
+static uint32_t modemUartHandshake() {
+    SerialAT.begin(MODEM_BAUDRATE, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
     Serial.println("[net] waiting for modem to respond to AT...");
-    if (!modem.testAT(MODEM_START_WAIT_MS)) {
-        Serial.println("[net] modem did not respond to AT in time; continuing anyway");
-    }
-    modem.init();
-    Serial.print("[net] modem info: ");
-    Serial.println(modem.getModemInfo());
 
-    // ---- UART baud upgrade --------------------------------------------------
-    // The modem boots at MODEM_BAUDRATE (115200). Tell it to switch to
-    // MODEM_TARGET_BAUDRATE via AT+IPR, then reconfigure the ESP32's UART to
-    // match. If the handshake fails at the new speed, fall back silently --
-    // everything still works, just slower.
-#if MODEM_TARGET_BAUDRATE != MODEM_BAUDRATE
-    Serial.printf("[net] upgrading UART baud %d -> %d...\n",
-                  MODEM_BAUDRATE, MODEM_TARGET_BAUDRATE);
-    modem.sendAT("+IPR=", MODEM_TARGET_BAUDRATE);
-    delay(100); // give the modem time to reconfigure its UART
-    SerialAT.updateBaudRate(MODEM_TARGET_BAUDRATE);
-    delay(100);
-    if (modem.testAT(3000)) {
-        Serial.printf("[net] UART running at %d baud\n", MODEM_TARGET_BAUDRATE);
-    } else {
-        Serial.printf("[net] modem did not respond at %d baud, reverting to %d\n",
-                      MODEM_TARGET_BAUDRATE, MODEM_BAUDRATE);
-        SerialAT.updateBaudRate(MODEM_BAUDRATE);
-        modem.sendAT("+IPR=", MODEM_BAUDRATE);
-        delay(100);
+    uint32_t baud = detectModemBaud(15000);
+    if (baud == 0) {
+        Serial.println("[net] modem did not respond to AT at either baud");
+        SerialAT.end();
+        return 0;
     }
-#endif
+
+    if (baud != MODEM_TARGET_BAUDRATE) {
+        char cmd[24];
+        snprintf(cmd, sizeof(cmd), "AT+IPR=%lu", (unsigned long)MODEM_TARGET_BAUDRATE);
+        if (rawAt(cmd, 1000) && probeAt(MODEM_TARGET_BAUDRATE, 1000)) {
+            baud = MODEM_TARGET_BAUDRATE;
+        } else {
+            // The modem may have switched even though we can't hear it; tell
+            // it to come back at the new rate, then listen at the old one.
+            SerialAT.updateBaudRate(MODEM_TARGET_BAUDRATE);
+            snprintf(cmd, sizeof(cmd), "AT+IPR=%lu", (unsigned long)MODEM_BAUDRATE);
+            rawAt(cmd, 300);
+            SerialAT.updateBaudRate(MODEM_BAUDRATE);
+            Serial.printf("[net] modem would not run at %lu baud, staying at %lu\n",
+                          (unsigned long)MODEM_TARGET_BAUDRATE, (unsigned long)MODEM_BAUDRATE);
+        }
+    }
+    Serial.printf("[net] modem UART at %lu baud\n", (unsigned long)baud);
+    SerialAT.end(); // PPP installs its own UART driver on the same port
+    return baud;
 }
 
 // Prints the modem state that actually explains a registration failure. Without
@@ -179,16 +222,13 @@ static void modemPowerOn() {
 // unplugged, the SIM is PIN-locked, the carrier is rejecting the device, or the
 // modem simply needs longer to scan bands -- and those need opposite fixes.
 static void logModemDiagnostics() {
-    int simStatus = modem.getSimStatus();
-    const char *simText = simStatus == SIM_READY   ? "ready"
-                          : simStatus == SIM_LOCKED ? "LOCKED -- set TELEMETRY_GSM_PIN in .env"
-                          : simStatus == SIM_ANTITHEFT_LOCKED ? "anti-theft locked"
-                                                              : "error / not detected";
-    Serial.printf("[net]   SIM: %s (%d)\n", simText, simStatus);
+    String sim = PPP.cmd("AT+CPIN?", 1000);
+    sim.trim();
+    Serial.printf("[net]   SIM: %s\n", sim.length() ? sim.c_str() : "no answer -- SIM missing?");
 
     // CSQ is 0..31, or 99 for "unknown". RSSI dBm = -113 + 2*CSQ, so anything
     // below ~10 (-93 dBm) is marginal and 99 usually means no antenna.
-    int16_t csq = modem.getSignalQuality();
+    int csq = PPP.RSSI();
     if (csq == 99 || csq < 0) {
         Serial.println("[net]   signal: none (CSQ 99) -- check the antenna is connected");
     } else {
@@ -196,56 +236,100 @@ static void logModemDiagnostics() {
                       csq < 10 ? " -- marginal" : "");
     }
 
-    RegStatus reg = modem.getRegistrationStatus();
+    String cereg = PPP.cmd("AT+CEREG?", 1000);
+    int n = -1, stat = -1;
+    int idx = cereg.indexOf("+CEREG:");
+    if (idx >= 0) sscanf(cereg.c_str() + idx, "+CEREG: %d,%d", &n, &stat);
     const char *regText;
-    switch (reg) {
-        case REG_UNREGISTERED: regText = "not registered, not searching"; break;
-        case REG_OK_HOME:      regText = "registered (home)"; break;
-        case REG_SEARCHING:    regText = "searching -- may just need more time"; break;
-        case REG_DENIED:       regText = "DENIED by carrier -- SIM not provisioned for this device"; break;
-        case REG_OK_ROAMING:   regText = "registered (roaming)"; break;
-        case REG_SMS_ONLY:     regText = "SMS only -- no data service on this SIM"; break;
-        default:               regText = "unknown"; break;
+    switch (stat) {
+        case 0:  regText = "not registered, not searching"; break;
+        case 1:  regText = "registered (home)"; break;
+        case 2:  regText = "searching -- may just need more time"; break;
+        case 3:  regText = "DENIED by carrier -- SIM not provisioned for this device"; break;
+        case 5:  regText = "registered (roaming)"; break;
+        case 6:  regText = "SMS only -- no data service on this SIM"; break;
+        default: regText = "unknown"; break;
     }
-    Serial.printf("[net]   registration (CEREG): %s (%d)\n", regText, (int)reg);
+    Serial.printf("[net]   registration (CEREG): %s (%d)\n", regText, stat);
 
-    String op = modem.getOperator();
+    String op = PPP.operatorName();
     Serial.printf("[net]   operator: %s\n", op.length() ? op.c_str() : "(none)");
 }
 
-// ---- Registration / GPRS -------------------------------------------------
+// ---- Registration / PPP --------------------------------------------------
+// PPP runs in CMUX mode: one virtual channel carries PPP data, the other stays
+// in AT command mode, so diagnostics and SMS keep working while the link is up.
+static bool s_pppStarted = false;
+static bool s_sntpStarted = false;
+
+static bool pppStart() {
+    uint32_t baud = modemUartHandshake();
+    if (baud == 0) return false;
+
+    PPP.setApn(TELEMETRY_APN);
+    if (strlen(TELEMETRY_GSM_PIN)) PPP.setPin(TELEMETRY_GSM_PIN);
+    PPP.setPins(MODEM_TX_PIN, MODEM_RX_PIN); // no RTS/CTS routed on this board
+    if (!PPP.begin(PPP_MODEM_MODEL, 1, baud)) {
+        Serial.println("[net] PPP.begin failed (modem sync)");
+        return false;
+    }
+    Serial.printf("[net] modem: %s, IMEI %s\n", PPP.moduleName().c_str(), PPP.IMEI().c_str());
+
+    return true;
+}
+
 static bool ensureNetworkConnected() {
-    if (modem.isNetworkConnected() && modem.isGprsConnected()) {
-        return true;
+    if (PPP.connected()) return true;
+
+    if (s_pppStarted && PPP.mode() == ESP_MODEM_MODE_CMUX) {
+        // Data channel was up and has since dropped. Restarting from a hard
+        // reset is the only recovery that doesn't depend on the modem leaving
+        // CMUX cleanly.
+        Serial.println("[net] PPP link lost; resetting modem");
+        PPP.end();
+        s_pppStarted = false;
+        modemPowerPins();
     }
+
     Serial.println("[net] (re)connecting to cellular network...");
-    // SIM_READY, not the literal 3 -- 3 is SIM_ANTITHEFT_LOCKED (TinyGsmGPRS.tpp),
-    // so the old comparison skipped the unlock only in a case that never applies.
-    if (strlen(TELEMETRY_GSM_PIN) && modem.getSimStatus() != SIM_READY) {
-        modem.simUnlock(TELEMETRY_GSM_PIN);
+    if (!s_pppStarted) {
+        s_pppStarted = pppStart();
+        if (!s_pppStarted) return false;
     }
-    if (!modem.waitForNetwork(MODEM_REGISTRATION_TIMEOUT_MS)) {
-        Serial.println("[net] network registration failed");
-        logModemDiagnostics();
+
+    uint32_t start = millis();
+    while (!PPP.attached()) {
+        if (millis() - start >= MODEM_REGISTRATION_TIMEOUT_MS) {
+            Serial.println("[net] network registration failed");
+            logModemDiagnostics();
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    if (!PPP.mode(ESP_MODEM_MODE_CMUX)) {
+        Serial.println("[net] failed to enter CMUX/PPP data mode");
         return false;
     }
-    if (!modem.gprsConnect(TELEMETRY_APN, TELEMETRY_APN_USER, TELEMETRY_APN_PASS)) {
-        Serial.println("[net] GPRS/PDP context connect failed");
+    if (!PPP.waitStatusBits(ESP_NETIF_CONNECTED_BIT, PPP_CONNECT_TIMEOUT_MS)) {
+        Serial.println("[net] PPP did not get an IP address");
         return false;
     }
-    Serial.println("[net] cellular network + PDP context up");
+    Serial.printf("[net] PPP up, IP %s\n", PPP.localIP().toString().c_str());
+    if (!s_sntpStarted) {
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        s_sntpStarted = true;
+    }
     return true;
 }
 
 #if SMS_TEST_ENABLED
 // Runs once, the first time the modem is registered on the network --
-// confirms the SIM/plan can send texts at all. Deliberately gated on
-// modem.isNetworkConnected() only, not ensureNetworkConnected()'s full
-// network+GPRS bar: AT+CMGS goes out over plain network registration and
-// doesn't need the PDP context that GPRS/MQTT requires.
+// confirms the SIM/plan can send texts at all. Gated on registration only,
+// not the PPP data link: AT+CMGS goes out over plain network registration.
 static void runSmsTest() {
     static bool done = false;
-    if (done || !modem.isNetworkConnected()) return;
+    if (done || !s_pppStarted || !PPP.attached()) return;
     done = true;
 
     if (!strlen(SMS_TEST_NUMBER)) {
@@ -254,7 +338,7 @@ static void runSmsTest() {
     }
 
     Serial.printf("[sms] sending test SMS to %s...\n", SMS_TEST_NUMBER);
-    if (modem.sendSMS(SMS_TEST_NUMBER, SMS_TEST_MESSAGE)) {
+    if (PPP.sms(SMS_TEST_NUMBER, SMS_TEST_MESSAGE)) {
         Serial.println("[sms] test SMS sent");
     } else {
         Serial.println("[sms] test SMS send failed");
@@ -271,7 +355,7 @@ static bool networkBearerUp() {
     return WiFi.status() == WL_CONNECTED;
 #endif
 #else
-    return modem.isGprsConnected();
+    return PPP.connected();
 #endif
 }
 
@@ -653,7 +737,7 @@ static void netTask(void *) {
     }
 
 #if !TELEMETRY_USE_WIFI
-    modemPowerOn();
+    modemPowerPins();
 #if MODEM_USB_BENCH_MODE
     Serial.println("[net] MODEM_USB_BENCH_MODE=1 -- modem is powered on and idle, "
                     "UART1 will stay silent from here on. Drive it over its own "
@@ -663,6 +747,11 @@ static void netTask(void *) {
     }
 #endif
 #endif
+#if !TELEMETRY_USE_WIFI && MQTT_USE_TLS
+    // Certificate validation stays off, same as the modem-side TLS it replaces
+    // -- see MQTT_USE_TLS in telemetry_config.h.
+    netClient.setInsecure();
+#endif
     mqtt.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
     mqtt.setBufferSize(MQTT_BUFFER_SIZE);
 
@@ -671,11 +760,13 @@ static void netTask(void *) {
     Serial.println("[net] AP mode has no internet uplink; skipping NTP time sync "
                     "(inter-frame relative timing is unaffected)");
 #else
-#if TELEMETRY_USE_WIFI
-    bool timeSynced = g_timeSync.syncFromSystemClock();
-#else
-    bool timeSynced = g_timeSync.sync(modem);
-#endif
+    // SNTP was only just started by ensureNetworkConnected(); give its first
+    // reply a moment instead of waiting a full TIME_SYNC_INTERVAL_MS.
+    bool timeSynced = false;
+    for (uint32_t start = millis(); !timeSynced && millis() - start < 10000;) {
+        timeSynced = g_timeSync.syncFromSystemClock();
+        if (!timeSynced) vTaskDelay(pdMS_TO_TICKS(250));
+    }
     Serial.println(timeSynced ? "[net] initial time sync OK"
                                : "[net] initial time sync failed; will retry periodically");
 #endif
@@ -697,11 +788,7 @@ static void netTask(void *) {
 #if !(TELEMETRY_USE_WIFI && WIFI_AP_MODE)
         if (now - s_lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS) {
             s_lastTimeSyncMs = now;
-#if TELEMETRY_USE_WIFI
             if (!g_timeSync.syncFromSystemClock()) {
-#else
-            if (!g_timeSync.sync(modem)) {
-#endif
                 Serial.println("[net] periodic time sync failed");
             }
         }
@@ -723,6 +810,7 @@ static void netTask(void *) {
 }
 
 void netTaskStart() {
-    xTaskCreatePinnedToCore(netTask, "net_task", 8192, nullptr, tskIDLE_PRIORITY + 2,
+    // TLS handshakes now run in mbedTLS on this task's stack, not in the modem.
+    xTaskCreatePinnedToCore(netTask, "net_task", 12288, nullptr, tskIDLE_PRIORITY + 2,
                              nullptr, 1);
 }
