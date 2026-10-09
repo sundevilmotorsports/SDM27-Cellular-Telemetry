@@ -170,7 +170,7 @@ def on_message(client, userdata, msg):
             if "stress_summary" in parsed:
                 print(f"\n{'='*70}")
                 print(f"[{timestamp}] ★ STRESS TEST RESULT: {parsed.get('avg_kbps', 0)} kbps ({parsed.get('avg_bps', 0)} bps)")
-                print(f"              {parsed.get('total_bytes', 0)} bytes over {parsed.get('duration_ms', 0)} ms (~{parsed.get('ms_per_chunk', 0)} ms/chunk)")
+                print(f"              {parsed.get('total_bytes', 0)} bytes over {parsed.get('duration_ms', 0)} ms (~{parsed.get('ms_per_publish', 0)} ms/publish)")
                 print(f"{'='*70}\n")
             elif "stress_seq" in parsed:
                 print(f"[{timestamp}] #{current_num:04d} {topic} [stress seq={parsed['stress_seq']}] ({length}B, {data_totals})")
@@ -193,7 +193,7 @@ def on_message(client, userdata, msg):
             print(f"[{timestamp}] ★ STRESS TEST COMPLETED!")
             print(f"  Speed       : {parsed.get('avg_kbps', 0)} kbps ({parsed.get('avg_bps', 0)} bps)")
             print(f"  Data Moved  : {parsed.get('total_bytes', 0)} bytes in {parsed.get('duration_ms', 0)} ms")
-            print(f"  Packet Time : ~{parsed.get('ms_per_chunk', 0)} ms per 1400B chunk")
+            print(f"  Publish Time: ~{parsed.get('ms_per_publish', 0)} ms per publish")
             print(f"{'='*70}\n")
             return
     except Exception:

@@ -450,18 +450,10 @@ static void spoolBatch(const String &json) {
     Serial.printf("[net] spooled batch to %s\n", path);
 }
 
-// ---- Raw (PubSubClient-bypassing) MQTT PUBLISH framing --------------------
-// PubSubClient::publish() chunks its internal write() calls to
-// MQTT_MAX_TRANSFER_SIZE (255, capped by a uint8_t inside PubSubClient itself
-// -- see platformio.ini). Each chunk is a separate AT+CCHSEND/AT+CIPSEND
-// round-trip to the modem (~30-50ms each), so a 4KB batch becomes ~16 round-
-// trips. This builds the MQTT PUBLISH packet by hand and writes it to
-// netClient in RAW_PUBLISH_CHUNK_BYTES-sized pieces, cutting the number of
-// modem round-trips ~6x. Used by both real publishes and the stress test.
-//
-// Keep RAW_PUBLISH_CHUNK_BYTES <= ~1460: SIMCom's AT command manual caps a
-// single CCHSEND/CIPSEND payload at the TCP MSS; larger sends are rejected.
-#define RAW_PUBLISH_CHUNK_BYTES 1400
+// ---- Raw MQTT PUBLISH framing ---------------------------------------------
+// Builds the whole PUBLISH packet and hands it to the socket in one write(),
+// so TLS gets full-size records and lwIP full-size segments. PubSubClient's
+// publish() would instead copy through its own buffer and split the write.
 static void mqttEncodeString(std::vector<uint8_t> &out, const char *s) {
     uint16_t len = (uint16_t)strlen(s);
     out.push_back((uint8_t)(len >> 8));
@@ -478,33 +470,18 @@ static void mqttEncodeRemainingLength(std::vector<uint8_t> &out, size_t n) {
     } while (n > 0);
 }
 
-// Sends one QoS-0 PUBLISH packet in <= chunkBytes pieces. Returns the number
-// of netClient.write() calls (each one AT+CCHSEND/AT+CIPSEND round-trip) it
-// took, or 0 if any write came up short.
-static uint32_t rawMqttPublish(const char *topic, const char *payload, size_t payloadLen,
-                                size_t chunkBytes) {
+static bool rawMqttPublish(const char *topic, const char *payload, size_t payloadLen) {
     std::vector<uint8_t> varHeader;
     mqttEncodeString(varHeader, topic);
 
-    std::vector<uint8_t> fixedHeader;
-    fixedHeader.push_back(0x30); // PUBLISH, QoS 0, no DUP/RETAIN
-    mqttEncodeRemainingLength(fixedHeader, varHeader.size() + payloadLen);
-    fixedHeader.insert(fixedHeader.end(), varHeader.begin(), varHeader.end());
+    std::vector<uint8_t> packet;
+    packet.reserve(5 + varHeader.size() + payloadLen);
+    packet.push_back(0x30); // PUBLISH, QoS 0, no DUP/RETAIN
+    mqttEncodeRemainingLength(packet, varHeader.size() + payloadLen);
+    packet.insert(packet.end(), varHeader.begin(), varHeader.end());
+    packet.insert(packet.end(), payload, payload + payloadLen);
 
-    uint32_t chunks = 0;
-    if (netClient.write(fixedHeader.data(), fixedHeader.size()) != fixedHeader.size()) return 0;
-    chunks++;
-
-    size_t offset = 0;
-    while (offset < payloadLen) {
-        size_t n = std::min(chunkBytes, payloadLen - offset);
-        if (netClient.write(reinterpret_cast<const uint8_t *>(payload) + offset, n) != n) {
-            return 0;
-        }
-        offset += n;
-        chunks++;
-    }
-    return chunks;
+    return netClient.write(packet.data(), packet.size()) == packet.size();
 }
 
 // Replays a bounded number of spooled batches per call so this never starves
@@ -556,8 +533,7 @@ static void replaySpooledBatches() {
             continue;
         }
 
-        if (rawMqttPublish(MQTT_TOPIC_TELEMETRY, payload.c_str(), payload.length(),
-                          RAW_PUBLISH_CHUNK_BYTES) > 0) {
+        if (rawMqttPublish(MQTT_TOPIC_TELEMETRY, payload.c_str(), payload.length())) {
             LittleFS.remove(path);
             replayed++;
             s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
@@ -602,18 +578,10 @@ static void runStressTest() {
     uint32_t windowBytes = 0;
     uint32_t totalBytes = 0;
     uint32_t seq = 0;
-    // Each publish is sent via rawMqttPublish(), in STRESS_RAW_CHUNK_BYTES
-    // chunks, bypassing PubSubClient's own writer (capped at 255 bytes by a
-    // uint8_t -- MQTT_MAX_TRANSFER_SIZE in platformio.ini) so this test can
-    // actually measure whether bigger AT+CCHSEND/AT+CIPSEND chunks change
-    // throughput. Timing each publish and dividing by its chunk count
-    // reveals ms/chunk at whatever STRESS_RAW_CHUNK_BYTES is set to --
-    // compare across a couple of values to see whether chunk size or a fixed
-    // per-chunk AT/modem/network round-trip cost dominates.
     uint32_t windowPublishMs = 0;
-    uint32_t windowChunks = 0;
+    uint32_t windowPublishes = 0;
     uint64_t totalPublishMs = 0;
-    uint32_t totalChunks = 0;
+    uint32_t totalPublishes = 0;
 
     while (millis() - startMs < STRESS_TEST_DURATION_S * 1000UL) {
         if (!mqtt.connected()) {
@@ -630,16 +598,15 @@ static void runStressTest() {
         json += "\"}";
 
         uint32_t pubStartMs = millis();
-        uint32_t chunks = rawMqttPublish(MQTT_TOPIC_STRESS, json.c_str(), json.length(),
-                                          RAW_PUBLISH_CHUNK_BYTES);
+        bool ok = rawMqttPublish(MQTT_TOPIC_STRESS, json.c_str(), json.length());
         uint32_t pubMs = millis() - pubStartMs;
-        if (chunks > 0) {
+        if (ok) {
             windowBytes += json.length();
             totalBytes += json.length();
             windowPublishMs += pubMs;
-            windowChunks += chunks;
+            windowPublishes++;
             totalPublishMs += pubMs;
-            totalChunks += chunks;
+            totalPublishes++;
         }
         mqtt.loop();
         yield(); // avoid starving the core-1 watchdog across a tight loop
@@ -648,16 +615,13 @@ static void runStressTest() {
         if (now - lastLogMs >= STRESS_LOG_INTERVAL_MS) {
             uint32_t windowMs = now - lastLogMs;
             uint32_t bps = (uint32_t)((uint64_t)windowBytes * 8000ULL / windowMs);
-            uint32_t msPerChunkX10 =
-                windowChunks > 0 ? (uint32_t)((uint64_t)windowPublishMs * 10 / windowChunks) : 0;
-            Serial.printf("[stress] %lu bps (target %lu), %lu.%lu ms/%d-byte chunk, "
-                          "%lu bytes so far\n",
+            uint32_t msPerPub = windowPublishes > 0 ? windowPublishMs / windowPublishes : 0;
+            Serial.printf("[stress] %lu bps (target %lu), %lu ms/publish, %lu bytes so far\n",
                           (unsigned long)bps, (unsigned long)STRESS_TARGET_BPS,
-                          (unsigned long)(msPerChunkX10 / 10), (unsigned long)(msPerChunkX10 % 10),
-                          (int)RAW_PUBLISH_CHUNK_BYTES, (unsigned long)totalBytes);
+                          (unsigned long)msPerPub, (unsigned long)totalBytes);
             windowBytes = 0;
             windowPublishMs = 0;
-            windowChunks = 0;
+            windowPublishes = 0;
             lastLogMs = now;
         }
     }
@@ -666,15 +630,12 @@ static void runStressTest() {
     uint32_t avgBps = elapsedMs > 0
                            ? (uint32_t)((uint64_t)totalBytes * 8000ULL / elapsedMs)
                            : 0;
-    uint32_t avgMsPerChunkX10 =
-        totalChunks > 0 ? (uint32_t)(totalPublishMs * 10 / totalChunks) : 0;
-    Serial.printf("[stress] done: %lu bytes over %lu ms, avg %lu bps (target %lu bps)\n",
+    uint32_t avgMsPerPub = totalPublishes > 0 ? (uint32_t)(totalPublishMs / totalPublishes) : 0;
+    Serial.printf("[stress] done: %lu bytes over %lu ms, avg %lu bps (target %lu bps), "
+                  "%lu publishes at %lu ms each\n",
                   (unsigned long)totalBytes, (unsigned long)elapsedMs,
-                  (unsigned long)avgBps, (unsigned long)STRESS_TARGET_BPS);
-    Serial.printf("[stress] avg %lu.%lu ms per <=%d-byte AT+CCHSEND/CIPSEND chunk over %lu "
-                  "chunks (RAW_PUBLISH_CHUNK_BYTES, bypassing PubSubClient's 255-byte cap)\n",
-                  (unsigned long)(avgMsPerChunkX10 / 10), (unsigned long)(avgMsPerChunkX10 % 10),
-                  (int)RAW_PUBLISH_CHUNK_BYTES, (unsigned long)totalChunks);
+                  (unsigned long)avgBps, (unsigned long)STRESS_TARGET_BPS,
+                  (unsigned long)totalPublishes, (unsigned long)avgMsPerPub);
 
     // Publish the final summary report over MQTT so it displays directly in the listener terminal
     String summaryJson = "{\"stress_summary\":true,\"total_bytes\":";
@@ -685,11 +646,10 @@ static void runStressTest() {
     summaryJson += avgBps;
     summaryJson += ",\"avg_kbps\":";
     summaryJson += (avgBps / 1000);
-    summaryJson += ",\"ms_per_chunk\":";
-    summaryJson += (avgMsPerChunkX10 / 10);
+    summaryJson += ",\"ms_per_publish\":";
+    summaryJson += avgMsPerPub;
     summaryJson += "}";
-    rawMqttPublish(MQTT_TOPIC_STRESS, summaryJson.c_str(), summaryJson.length(),
-                   RAW_PUBLISH_CHUNK_BYTES);
+    rawMqttPublish(MQTT_TOPIC_STRESS, summaryJson.c_str(), summaryJson.length());
 
     Serial.println("[stress] resuming normal telemetry publishing");
 }
@@ -714,8 +674,7 @@ static void drainAndPublish() {
     String json = telemetryFormatBatch(batch, TELEMETRY_DEVICE_ID, timeSyncEpochMsFor);
 
     if (mqtt.connected() &&
-        rawMqttPublish(MQTT_TOPIC_TELEMETRY, json.c_str(), json.length(),
-                       RAW_PUBLISH_CHUNK_BYTES) > 0) {
+        rawMqttPublish(MQTT_TOPIC_TELEMETRY, json.c_str(), json.length())) {
         Serial.printf("[net] published batch seq=%lu frames=%u dropped=%u\n",
                       (unsigned long)batch.seq, (unsigned)batch.frames.size(),
                       (unsigned)batch.dropped_frames);

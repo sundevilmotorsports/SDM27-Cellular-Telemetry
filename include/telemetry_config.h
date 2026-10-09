@@ -33,28 +33,19 @@
 // ---- Uplink stress test ---------------------------------------------------
 // Opt-in, off by default. When on, once MQTT connects the net task runs a
 // bounded burst of publishes -- fixed synthetic "pad" payloads back-to-back,
-// through the real batch JSON -> mqtt.publish -> TLS -> AT+CCHSEND -> modem
-// path, as fast as that path allows -- and logs the achieved throughput
-// against STRESS_TARGET_BPS. It does NOT touch the real CAN sim/batching
-// settings above: reaching a few Mbps by raising SIM_CAN_*_RATE_HZ and
-// BATCH_MAX_FRAMES isn't possible anyway, since canSimTask's loop
-// (can_handler.cpp) floors its own sleep at 1ms/pass (~1000 frames/sec max)
-// and each real CAN frame carries only 8 payload bytes.
+// through the real MQTT -> TLS -> PPP -> modem path, as fast as that path
+// allows -- and logs the achieved throughput against STRESS_TARGET_BPS. It
+// does NOT touch the real CAN sim/batching settings above.
 //
 // Read this before running it on a metered SIM: at STRESS_TARGET_BPS (5
-// Mbps) for STRESS_TEST_DURATION_S (60s) this is *designed* to try to move
-// ~37 MB. It will very likely fall far short of that -- see the ceiling
-// below -- but it will still spend whatever it manages to push, and that is
-// real billed data, not a simulation.
+// Mbps) for STRESS_TEST_DURATION_S this is *designed* to try to move several
+// MB. It will very likely fall short -- see the ceiling below -- but whatever
+// it manages to push is real billed data, not a simulation.
 //
-// The likely actual ceiling: MODEM_TARGET_BAUDRATE (board_pins.h) is 921600
-// baud, i.e. ~92 KB/s (~740 Kbps) raw across the ESP32<->modem UART, but
-// AT+CCHSEND round-trip overhead (~30-50ms per chunk) limits usable throughput
-// to roughly 200-250 Kbps even with RAW_PUBLISH_CHUNK_BYTES = 1400 (bypassing
-// PubSubClient's 255-byte cap). That UART link, not the cellular RF, the
-// Cat-1 modem's ~5 Mbps spec, or MQTT/TLS, is almost certainly the bottleneck.
-// This test exists to measure and report the real number, not to force the
-// target; do not read a result well under 5 Mbps as a bug.
+// The likely ceiling is the ESP32<->modem UART: PPP carries every byte over
+// it, so MODEM_TARGET_BAUDRATE (board_pins.h) / 10 is the most it can move --
+// ~92 KB/s (~740 Kbps) at 921600, less a few percent of PPP/TCP/TLS framing.
+// Past that, raise the baud (the handshake falls back if the modem refuses).
 #ifndef TELEMETRY_STRESS_TEST
 #define TELEMETRY_STRESS_TEST 0
 #endif
@@ -66,10 +57,6 @@
 // without needing an unrealistic CAN frame rate. Must comfortably fit under
 // MQTT_BUFFER_SIZE together with that header -- default headroom is ~4KB.
 #define STRESS_FILLER_BYTES 4096
-// RAW_PUBLISH_CHUNK_BYTES (defined in net_task.cpp) controls the chunk size
-// for all MQTT publishes, including the stress test. The stress test
-// previously had its own STRESS_RAW_CHUNK_BYTES here, but now shares the
-// same constant with real telemetry publishes.
 // Hard cap on how long the burst runs before it stops and prints a summary,
 // so a run left connected can't keep burning metered data indefinitely.
 // Runs once per boot; power-cycle or reflash to run it again.
