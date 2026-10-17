@@ -76,8 +76,10 @@ means one terminator is missing; about 40Ω means there's an extra one.
    [can] rx=0 state=ok rec=0 tec=0 fifo_overflows=0
    ```
 2. **Generator (C5).** Run `cd bench/can_tx_c5 && pio run -t upload &&
-   pio device monitor`. Use the C5's **UART** USB-C port for the monitor,
-   because `Serial` is UART0 in this build. Look for:
+   pio device monitor`. Use the C5's native **USB** USB-C port: the build
+   sets `ARDUINO_USB_CDC_ON_BOOT=1`, so it both flashes and prints there.
+   With both boards plugged in, pass `--upload-port`/`-p` (check which
+   `/dev/cu.usbmodem*` is which with `pio device list`). Look for:
    ```
    [can] TWAI-FD started, TX=23 RX=24. Commands: + - p b v
    [status] queued=20 sent_ok=20 seq=20 rate=10Hz state=ok tec=0 rec=0 ack_errors=0 bus_errors=0 no_slot=0
