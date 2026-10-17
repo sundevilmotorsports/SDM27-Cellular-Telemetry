@@ -106,7 +106,7 @@ regardless of simulated or real CAN source:
   never blocks.
 - **Time sync** (`time_sync.cpp`) is separate from frame capture entirely: it
   tracks an offset between the monotonic clock and true epoch time, synced
-  from the modem's network time (`AT+CCLK`) at boot and every 5 minutes. Each
+  from SNTP (over PPP or WiFi) at boot and every 5 minutes. Each
   frame's `epoch_ms` is computed by applying that offset to *its own*
   `capture_us` at serialization time -- a resync only shifts the offset for
   frames serialized afterward, it never touches an already-captured
@@ -258,23 +258,15 @@ push is real billed data on a metered SIM -- there is no dry-run mode. It is
 also very unlikely to get anywhere near the 5 Mbps target -- see below for
 what the real ceiling actually is and why.
 
-**What the publish is actually sent as:** it does NOT go through
-`mqtt.publish()`. `PubSubClient`'s own writer chunks every write to
-`MQTT_MAX_TRANSFER_SIZE` (255 bytes, capped by a `uint8_t` inside
-`PubSubClient` itself -- see the comment in `platformio.ini`; going over 255
-there truncates to 0 and hangs). That cap is fine for real telemetry batches,
-but it silently caps how big a single `AT+CCHSEND`/`AT+CIPSEND` chunk can be,
-which turned out to matter a lot for throughput (see measurements below). So
-the stress test instead builds the MQTT PUBLISH packet by hand
-(`rawMqttPublish()` in `net_task.cpp`) and writes it to the same already-open
-socket in `STRESS_RAW_CHUNK_BYTES`-sized pieces -- default 1400 bytes,
-just under the ~1460-1500 byte single-send cap SIMCom's AT command manual
-documents for CCHSEND/CIPSEND. Raise `STRESS_RAW_CHUNK_BYTES` further at your
-own risk -- past that cap the modem fails the send outright, it doesn't
-chunk for you.
+**What the publish is actually sent as:** the modem is a PPP bearer only
+(Arduino core 3.x `PPP` library, CMUX mode), so TCP runs in the ESP32's lwIP
+stack and TLS in mbedTLS. `rawMqttPublish()` in `net_task.cpp` builds the
+whole MQTT PUBLISH packet and hands it to the socket in one `write()` -- there
+are no per-chunk `AT+CCHSEND`/`AT+CIPSEND` round-trips any more.
 
-**Measured on this hardware** (T-Mobile `fast.t-mobile.com`, HiveMQ Cloud
-broker over TLS), holding everything else fixed and only changing chunk size:
+**Measured on this hardware before the switch to PPP** (T-Mobile
+`fast.t-mobile.com`, HiveMQ Cloud broker over TLS, modem-side TLS via
+`AT+CCHSEND`), holding everything else fixed and only changing chunk size:
 
 | Chunk size | Sustained throughput |
 |---|---|
@@ -282,14 +274,12 @@ broker over TLS), holding everything else fixed and only changing chunk size:
 | 1024 bytes (`rawMqttPublish`) | ~67.9 Kbps |
 | 1400 bytes (`rawMqttPublish`, current default) | ~72.0 Kbps |
 
-So the `uint8_t` chunk cap was real and was costing a genuine ~30%+ of
-achievable throughput -- but the gain flattens out well short of the 92 Kbps
-raw-UART figure and nowhere near the 5 Mbps Cat-1 spec. That flattening
-points at the modem's own AT-command/TLS processing plus the actual cellular
-RF link as the real remaining ceiling on this SIM/carrier, not the
-ESP32<->modem UART (115200 baud, `MODEM_BAUDRATE` in `include/board_pins.h`)
--- raising the baud rate is unlikely to move this number much further. A
-result well under 5 Mbps is the expected finding, not a bug in the test.
+Each of those chunks blocked on the modem confirming the send before the
+next could start, so throughput was bounded by chunk size / per-chunk round
+trip, not by the UART. Under PPP the ceiling is the UART itself:
+`MODEM_TARGET_BAUDRATE` / 10 bytes/s (~740 Kbps at 921600), less a few
+percent of PPP/TCP/TLS framing. A result well under 5 Mbps is still the
+expected finding, not a bug in the test.
 
 ## USB direct-to-modem bench (bypassing the ESP32<->modem UART)
 
@@ -333,28 +323,24 @@ and replug without touching the button before assuming something's wrong.
    python3 usb_modem_bench.py --probe                          # finds the AT port
    python3 usb_modem_bench.py --port <the port above> --duration 20
    ```
-   This drives the same AT command sequence `net_task.cpp` uses for MQTT
-   publish (`AT+CGDCONT`/`+NETOPEN`/`+CIPOPEN`/`+CIPSEND`, or
+   This drives the AT socket command sequence the firmware used for MQTT
+   publish before it switched to PPP (`AT+CGDCONT`/`+NETOPEN`/`+CIPOPEN`/`+CIPSEND`, or
    `+CSSLCFG`/`+CCHSTART`/`+CCHOPEN`/`+CCHSEND` when `MQTT_USE_TLS=1`) --
    same modem, same cellular link, same `MQTT_BROKER_HOST`/`_PORT` -- just
-   issued straight from the PC instead of relayed through UART1, and in
-   chunks up to `--chunk-size` (default 1024 bytes, well above this
-   firmware's 255-byte `MQTT_MAX_TRANSFER_SIZE` workaround) instead of the
-   firmware's 255-byte cap.
-4. Compare the printed avg bps against the firmware's own stress test result
-   at the same `--chunk-size`/`STRESS_RAW_CHUNK_BYTES`. On this hardware they
-   came out close (USB slightly slower, if anything) -- see the measured
-   numbers above.
+   issued straight from the PC instead of relayed through UART1, in chunks
+   up to `--chunk-size` (default 1024 bytes).
+4. Compare the printed avg bps against the firmware's own stress test
+   result. Before the PPP switch they came out close (USB slightly slower,
+   if anything) -- see the measured numbers above.
 
 **This also spends real billed data on a metered SIM, same as the firmware
 stress test** -- there is no dry-run mode here either.
 
 ## Known limitations
 
-- **Timestamp accuracy** is bounded by the modem's network-time
-  (`AT+CCLK`) sync granularity and by the ESP32<->modem AT-command
-  round-trip latency at sync time -- typically within a few hundred
-  milliseconds of true UTC, not GPS-disciplined precision. Inter-frame
+- **Timestamp accuracy** is bounded by SNTP over the cellular link --
+  typically within tens of milliseconds of true UTC, not GPS-disciplined
+  precision. Inter-frame
   *relative* timing (frame-to-frame within a short window) is far more
   accurate, since it comes entirely from the monotonic `esp_timer_get_time()`
   capture and is unaffected by sync jitter.
@@ -375,15 +361,11 @@ stress test** -- there is no dry-run mode here either.
 - **CAN filter accepts everything** (`TWAI_FILTER_CONFIG_ACCEPT_ALL()`).
   Fine for a PoC observing all bus traffic; a production node would filter
   to the IDs it actually needs.
-- **~70 Kbps measured ceiling on the cellular uplink** on this hardware/SIM,
-  regardless of the SIM7670G's own Cat-1 spec (~5 Mbps). It is NOT the
-  ESP32<->modem UART (115200 baud, ~92 Kbps raw) -- see [Uplink stress
-  test](#uplink-stress-test) for the measurements: fixing an artificial
-  255-byte AT+CCHSEND chunk cap recovered most of the gap to the UART's raw
-  capacity, and going straight to the modem over its own USB port (bypassing
-  the UART entirely) didn't beat it either. What's left points at the
-  modem's own AT/TLS processing and the real cellular RF link on this
-  carrier/SIM, not any one link in the ESP32's own pipeline.
+- **Uplink is capped by the ESP32<->modem UART**, not the SIM7670G's Cat-1
+  spec (~5 Mbps): PPP moves every byte over it, so the ceiling is
+  `MODEM_TARGET_BAUDRATE` / 10 bytes/s. The board has no RTS/CTS routed to
+  the modem, so very high baud rates may lose bytes (TCP retransmits them,
+  at a throughput cost).
 - **WiFi mode (`TELEMETRY_USE_WIFI=1`) is a bench-testing convenience**, not
   the deployment target -- it lets you prove the batch/MQTT/spool pipeline
   without a SIM card. It supports WPA2/WPA3-Personal and -Enterprise

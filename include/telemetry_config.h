@@ -33,28 +33,19 @@
 // ---- Uplink stress test ---------------------------------------------------
 // Opt-in, off by default. When on, once MQTT connects the net task runs a
 // bounded burst of publishes -- fixed synthetic "pad" payloads back-to-back,
-// through the real batch JSON -> mqtt.publish -> TLS -> AT+CCHSEND -> modem
-// path, as fast as that path allows -- and logs the achieved throughput
-// against STRESS_TARGET_BPS. It does NOT touch the real CAN sim/batching
-// settings above: reaching a few Mbps by raising SIM_CAN_*_RATE_HZ and
-// BATCH_MAX_FRAMES isn't possible anyway, since canSimTask's loop
-// (can_handler.cpp) floors its own sleep at 1ms/pass (~1000 frames/sec max)
-// and each real CAN frame carries only 8 payload bytes.
+// through the real MQTT -> TLS -> PPP -> modem path, as fast as that path
+// allows -- and logs the achieved throughput against STRESS_TARGET_BPS. It
+// does NOT touch the real CAN sim/batching settings above.
 //
 // Read this before running it on a metered SIM: at STRESS_TARGET_BPS (5
-// Mbps) for STRESS_TEST_DURATION_S (60s) this is *designed* to try to move
-// ~37 MB. It will very likely fall far short of that -- see the ceiling
-// below -- but it will still spend whatever it manages to push, and that is
-// real billed data, not a simulation.
+// Mbps) for STRESS_TEST_DURATION_S this is *designed* to try to move several
+// MB. It will very likely fall short -- see the ceiling below -- but whatever
+// it manages to push is real billed data, not a simulation.
 //
-// The likely actual ceiling: MODEM_TARGET_BAUDRATE (board_pins.h) is 921600
-// baud, i.e. ~92 KB/s (~740 Kbps) raw across the ESP32<->modem UART, but
-// AT+CCHSEND round-trip overhead (~30-50ms per chunk) limits usable throughput
-// to roughly 200-250 Kbps even with RAW_PUBLISH_CHUNK_BYTES = 1400 (bypassing
-// PubSubClient's 255-byte cap). That UART link, not the cellular RF, the
-// Cat-1 modem's ~5 Mbps spec, or MQTT/TLS, is almost certainly the bottleneck.
-// This test exists to measure and report the real number, not to force the
-// target; do not read a result well under 5 Mbps as a bug.
+// The likely ceiling is the ESP32<->modem UART: PPP carries every byte over
+// it, so MODEM_TARGET_BAUDRATE (board_pins.h) / 10 is the most it can move --
+// ~92 KB/s (~740 Kbps) at 921600, less a few percent of PPP/TCP/TLS framing.
+// Past that, raise the baud (the handshake falls back if the modem refuses).
 #ifndef TELEMETRY_STRESS_TEST
 #define TELEMETRY_STRESS_TEST 0
 #endif
@@ -66,10 +57,6 @@
 // without needing an unrealistic CAN frame rate. Must comfortably fit under
 // MQTT_BUFFER_SIZE together with that header -- default headroom is ~4KB.
 #define STRESS_FILLER_BYTES 4096
-// RAW_PUBLISH_CHUNK_BYTES (defined in net_task.cpp) controls the chunk size
-// for all MQTT publishes, including the stress test. The stress test
-// previously had its own STRESS_RAW_CHUNK_BYTES here, but now shares the
-// same constant with real telemetry publishes.
 // Hard cap on how long the burst runs before it stops and prints a summary,
 // so a run left connected can't keep burning metered data indefinitely.
 // Runs once per boot; power-cycle or reflash to run it again.
@@ -87,8 +74,8 @@
 //     Type-C port) is free for a PC to drive directly, e.g. with
 //     usb_modem_bench.py. The point is measuring throughput without the
 //     ESP32<->modem UART1 link (115200 baud, see MODEM_BAUDRATE) in the path
-//     at all, instead of through AT+CCHSEND/AT+CIPSEND issued by this
-//     firmware over UART1 (MODEM_TARGET_BAUDRATE, see board_pins.h).
+//     at all, instead of through PPP over UART1 (MODEM_TARGET_BAUDRATE, see
+//     board_pins.h).
 // 0 = off (default) -- normal operation.
 // Cellular only, same reasoning as SMS_TEST_ENABLED -- build error under
 // TELEMETRY_USE_WIFI=1 (see the check in net_task.cpp).
@@ -171,6 +158,18 @@
 #ifndef TELEMETRY_GSM_PIN
 #define TELEMETRY_GSM_PIN "" // SIM PIN, leave empty if none
 #endif
+// esp_modem device profile for the Arduino PPP library. GENERIC sticks to
+// standard 3GPP commands; PPP_MODEM_SIM7600 is the closest SIMCom-specific
+// profile if GENERIC misbehaves on the SIM7670G.
+#define PPP_MODEM_MODEL PPP_MODEM_GENERIC
+// PDP context type requested for the PPP session. T-Mobile gives this SIM an
+// IPv6-only context whatever is asked for; PPP then runs over IPV6CP (enabled
+// via custom_sdkconfig in platformio.ini) and reaches IPv4 hosts via NAT64.
+#ifndef PPP_PDP_TYPE
+#define PPP_PDP_TYPE "IPV4V6"
+#endif
+// How long to wait for an IP once the modem has switched to PPP data mode.
+#define PPP_CONNECT_TIMEOUT_MS 30000
 
 // ---- MQTT ----------------------------------------------------------
 // Default broker: if running in SoftAP mode, default to 192.168.4.2 (laptop
@@ -186,15 +185,14 @@
 //     Serverless) which refuse plaintext connections entirely.
 // 0 = plaintext MQTT.
 //
-// Cellular only. The WiFi path uses a plain WiFiClient and would need a
-// WiFiClientSecure to match; not wired up, because WiFi mode exists for bench
-// testing against a local broker where TLS buys nothing.
+// Cellular only. TLS runs on the ESP32 (mbedTLS over the PPP link). The WiFi
+// path uses a plain WiFiClient; not wired up for TLS, because WiFi mode exists
+// for bench testing against a local broker where TLS buys nothing.
 //
-// Caveat worth knowing: the TinyGSM fork leaves AT+CSSLCFG "authmode" at 0
-// (TinyGsmClientSIM7672.h, modemConnect), so the link is encrypted but the
-// broker's certificate is NOT validated -- this stops passive eavesdropping,
-// not an active man-in-the-middle. Loading a CA cert onto the modem and
-// calling setCertificate() would close that gap.
+// Caveat worth knowing: netClient.setInsecure() (net_task.cpp) means the link
+// is encrypted but the broker's certificate is NOT validated -- this stops
+// passive eavesdropping, not an active man-in-the-middle. Swapping it for
+// setCACert() / setCACertBundle() would close that gap.
 #ifndef MQTT_USE_TLS
 #define MQTT_USE_TLS 0
 #endif

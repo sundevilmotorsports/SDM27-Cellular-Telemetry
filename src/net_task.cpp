@@ -24,17 +24,19 @@
 #include <WiFi.h>
 static WiFiClient netClient;
 #else
-#include "gsm_modem.h"
+// The modem is only a PPP bearer: TCP runs in the ESP32's lwIP stack and TLS
+// in mbedTLS, so a publish is one socket write instead of one AT+CCHSEND /
+// AT+CIPSEND round-trip per ~1.4KB chunk.
+#include <PPP.h>
+#include <esp_netif_ppp.h>
+#include <esp_modem_api.h>
 static HardwareSerial &SerialAT = Serial1;
-static TinyGsm modem(SerialAT);
 #if MQTT_USE_TLS
-// TLS runs over the modem's +CCH SSL channel rather than a TCP socket. SNI is
-// enabled by the driver, which multi-tenant brokers like HiveMQ Cloud require
-// to route to the right cluster. Certificate validation is off -- see
-// MQTT_USE_TLS in telemetry_config.h.
-static TinyGsmClientSecure netClient(modem);
+#include <NetworkClientSecure.h>
+static NetworkClientSecure netClient;
 #else
-static TinyGsmClient netClient(modem);
+#include <NetworkClient.h>
+static NetworkClient netClient;
 #endif
 #endif
 
@@ -118,10 +120,9 @@ static bool ensureNetworkConnected() {
 #else
 // ---- Modem power-on -----------------------------------------------------
 // Sequence transcribed from LilyGo's ATdebug example (examples/ATdebug/ATdebug.ino)
-// for TINY_GSM_MODEM_SIM7670G: reset pulse, DTR low, then a PWRKEY pulse.
-static void modemPowerOn() {
-    SerialAT.begin(MODEM_BAUDRATE, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
-
+// for the SIM7670G: reset pulse, DTR low, then a PWRKEY pulse. Also used to
+// recover a wedged PPP session: the reset pulse drops the modem out of CMUX.
+static void modemPowerPins() {
     pinMode(BOARD_LED_PIN, OUTPUT);
     digitalWrite(BOARD_LED_PIN, !LED_ON);
 
@@ -141,37 +142,81 @@ static void modemPowerOn() {
     digitalWrite(BOARD_PWRKEY_PIN, HIGH);
     delay(MODEM_POWERON_PULSE_WIDTH_MS);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
+}
 
+// Minimal AT exchange on Serial1, used only before PPP owns the UART.
+static bool rawAt(const char *cmd, uint32_t timeoutMs) {
+    while (SerialAT.available()) SerialAT.read();
+    SerialAT.print(cmd);
+    SerialAT.print("\r");
+    String resp;
+    uint32_t start = millis();
+    while (millis() - start < timeoutMs) {
+        while (SerialAT.available()) {
+            resp += (char)SerialAT.read();
+            if (resp.endsWith("OK\r\n")) return true;
+            if (resp.endsWith("ERROR\r\n")) return false;
+        }
+        delay(2);
+    }
+    return false;
+}
+
+static bool probeAt(uint32_t baud, uint32_t timeoutMs) {
+    SerialAT.updateBaudRate(baud);
+    uint32_t start = millis();
+    while (millis() - start < timeoutMs) {
+        if (rawAt("AT", 300)) return true;
+    }
+    return false;
+}
+
+// A cold SIM7670G takes several seconds to answer AT. Both rates are tried
+// because SIMCom modems may persist AT+IPR across resets.
+static uint32_t detectModemBaud(uint32_t timeoutMs) {
+    const uint32_t bauds[] = {MODEM_BAUDRATE, MODEM_TARGET_BAUDRATE};
+    uint32_t start = millis();
+    while (millis() - start < timeoutMs) {
+        for (uint32_t b : bauds) {
+            if (probeAt(b, 300)) return b;
+        }
+    }
+    return 0;
+}
+
+// Gets the modem talking at MODEM_TARGET_BAUDRATE if it can and returns the
+// baud it ended up at, or 0 if it never answered. The baud is the hard ceiling
+// on throughput under PPP, so this matters more than it did over AT sockets.
+static uint32_t modemUartHandshake() {
+    SerialAT.begin(MODEM_BAUDRATE, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
     Serial.println("[net] waiting for modem to respond to AT...");
-    if (!modem.testAT(MODEM_START_WAIT_MS)) {
-        Serial.println("[net] modem did not respond to AT in time; continuing anyway");
-    }
-    modem.init();
-    Serial.print("[net] modem info: ");
-    Serial.println(modem.getModemInfo());
 
-    // ---- UART baud upgrade --------------------------------------------------
-    // The modem boots at MODEM_BAUDRATE (115200). Tell it to switch to
-    // MODEM_TARGET_BAUDRATE via AT+IPR, then reconfigure the ESP32's UART to
-    // match. If the handshake fails at the new speed, fall back silently --
-    // everything still works, just slower.
-#if MODEM_TARGET_BAUDRATE != MODEM_BAUDRATE
-    Serial.printf("[net] upgrading UART baud %d -> %d...\n",
-                  MODEM_BAUDRATE, MODEM_TARGET_BAUDRATE);
-    modem.sendAT("+IPR=", MODEM_TARGET_BAUDRATE);
-    delay(100); // give the modem time to reconfigure its UART
-    SerialAT.updateBaudRate(MODEM_TARGET_BAUDRATE);
-    delay(100);
-    if (modem.testAT(3000)) {
-        Serial.printf("[net] UART running at %d baud\n", MODEM_TARGET_BAUDRATE);
-    } else {
-        Serial.printf("[net] modem did not respond at %d baud, reverting to %d\n",
-                      MODEM_TARGET_BAUDRATE, MODEM_BAUDRATE);
-        SerialAT.updateBaudRate(MODEM_BAUDRATE);
-        modem.sendAT("+IPR=", MODEM_BAUDRATE);
-        delay(100);
+    uint32_t baud = detectModemBaud(15000);
+    if (baud == 0) {
+        Serial.println("[net] modem did not respond to AT at either baud");
+        SerialAT.end();
+        return 0;
     }
-#endif
+
+    if (baud != MODEM_TARGET_BAUDRATE) {
+        char cmd[24];
+        snprintf(cmd, sizeof(cmd), "AT+IPR=%lu", (unsigned long)MODEM_TARGET_BAUDRATE);
+        if (rawAt(cmd, 1000) && probeAt(MODEM_TARGET_BAUDRATE, 1000)) {
+            baud = MODEM_TARGET_BAUDRATE;
+        } else {
+            // The modem may have switched even though we can't hear it; tell
+            // it to come back at the new rate, then listen at the old one.
+            SerialAT.updateBaudRate(MODEM_TARGET_BAUDRATE);
+            snprintf(cmd, sizeof(cmd), "AT+IPR=%lu", (unsigned long)MODEM_BAUDRATE);
+            rawAt(cmd, 300);
+            SerialAT.updateBaudRate(MODEM_BAUDRATE);
+            Serial.printf("[net] modem would not run at %lu baud, staying at %lu\n",
+                          (unsigned long)MODEM_TARGET_BAUDRATE, (unsigned long)MODEM_BAUDRATE);
+        }
+    }
+    Serial.printf("[net] modem UART at %lu baud\n", (unsigned long)baud);
+    SerialAT.end(); // PPP installs its own UART driver on the same port
+    return baud;
 }
 
 // Prints the modem state that actually explains a registration failure. Without
@@ -179,16 +224,13 @@ static void modemPowerOn() {
 // unplugged, the SIM is PIN-locked, the carrier is rejecting the device, or the
 // modem simply needs longer to scan bands -- and those need opposite fixes.
 static void logModemDiagnostics() {
-    int simStatus = modem.getSimStatus();
-    const char *simText = simStatus == SIM_READY   ? "ready"
-                          : simStatus == SIM_LOCKED ? "LOCKED -- set TELEMETRY_GSM_PIN in .env"
-                          : simStatus == SIM_ANTITHEFT_LOCKED ? "anti-theft locked"
-                                                              : "error / not detected";
-    Serial.printf("[net]   SIM: %s (%d)\n", simText, simStatus);
+    String sim = PPP.cmd("AT+CPIN?", 1000);
+    sim.trim();
+    Serial.printf("[net]   SIM: %s\n", sim.length() ? sim.c_str() : "no answer -- SIM missing?");
 
     // CSQ is 0..31, or 99 for "unknown". RSSI dBm = -113 + 2*CSQ, so anything
     // below ~10 (-93 dBm) is marginal and 99 usually means no antenna.
-    int16_t csq = modem.getSignalQuality();
+    int csq = PPP.RSSI();
     if (csq == 99 || csq < 0) {
         Serial.println("[net]   signal: none (CSQ 99) -- check the antenna is connected");
     } else {
@@ -196,56 +238,206 @@ static void logModemDiagnostics() {
                       csq < 10 ? " -- marginal" : "");
     }
 
-    RegStatus reg = modem.getRegistrationStatus();
+    String cereg = PPP.cmd("AT+CEREG?", 1000);
+    int n = -1, stat = -1;
+    int idx = cereg.indexOf("+CEREG:");
+    if (idx >= 0) sscanf(cereg.c_str() + idx, "+CEREG: %d,%d", &n, &stat);
     const char *regText;
-    switch (reg) {
-        case REG_UNREGISTERED: regText = "not registered, not searching"; break;
-        case REG_OK_HOME:      regText = "registered (home)"; break;
-        case REG_SEARCHING:    regText = "searching -- may just need more time"; break;
-        case REG_DENIED:       regText = "DENIED by carrier -- SIM not provisioned for this device"; break;
-        case REG_OK_ROAMING:   regText = "registered (roaming)"; break;
-        case REG_SMS_ONLY:     regText = "SMS only -- no data service on this SIM"; break;
-        default:               regText = "unknown"; break;
+    switch (stat) {
+        case 0:  regText = "not registered, not searching"; break;
+        case 1:  regText = "registered (home)"; break;
+        case 2:  regText = "searching -- may just need more time"; break;
+        case 3:  regText = "DENIED by carrier -- SIM not provisioned for this device"; break;
+        case 5:  regText = "registered (roaming)"; break;
+        case 6:  regText = "SMS only -- no data service on this SIM"; break;
+        default: regText = "unknown"; break;
     }
-    Serial.printf("[net]   registration (CEREG): %s (%d)\n", regText, (int)reg);
+    Serial.printf("[net]   registration (CEREG): %s (%d)\n", regText, stat);
 
-    String op = modem.getOperator();
+    String op = PPP.operatorName();
     Serial.printf("[net]   operator: %s\n", op.length() ? op.c_str() : "(none)");
 }
 
-// ---- Registration / GPRS -------------------------------------------------
-static bool ensureNetworkConnected() {
-    if (modem.isNetworkConnected() && modem.isGprsConnected()) {
+// ---- Registration / PPP --------------------------------------------------
+// PPP runs in CMUX mode: one virtual channel carries PPP data, the other stays
+// in AT command mode, so diagnostics and SMS keep working while the link is up.
+static bool s_pppStarted = false;
+static bool s_sntpStarted = false;
+
+// +CGCONTRDP prints addresses as dot-separated decimal bytes: 4 for IPv4,
+// 16 for IPv6.
+static bool parseModemAddr(const String &s, esp_ip_addr_t &out) {
+    uint8_t b[16];
+    int n = 0;
+    const char *p = s.c_str();
+    while (n < 16) {
+        char *end;
+        long v = strtol(p, &end, 10);
+        if (end == p || v < 0 || v > 255) return false;
+        b[n++] = (uint8_t)v;
+        p = end;
+        if (*p != '.') break;
+        p++;
+    }
+    if (*p) return false;
+    memset(&out, 0, sizeof(out));
+    if (n == 4) {
+        out.type = ESP_IPADDR_TYPE_V4;
+        memcpy(&out.u_addr.ip4.addr, b, 4);
         return true;
     }
+    if (n == 16) {
+        out.type = ESP_IPADDR_TYPE_V6;
+        memcpy(out.u_addr.ip6.addr, b, 16);
+        return true;
+    }
+    return false;
+}
+
+// lwIP only learns DNS servers over PPP from IPCP, which never completes on an
+// IPv6-only context. Take the carrier's servers from the modem instead: on
+// T-Mobile they are DNS64, so IPv4-only hosts like the broker come back as
+// NAT64 addresses reachable over IPv6.
+static void configureDnsFromModem() {
+    String r = PPP.cmd("AT+CGCONTRDP=1", 2000);
+    // +CGCONTRDP: <cid>,<bearer>,"<apn>","<addr mask>","<gw>","<dns1>","<dns2>",...
+    std::vector<String> quoted;
+    int line = r.indexOf("+CGCONTRDP:");
+    int lineEnd = line >= 0 ? r.indexOf('\n', line) : -1;
+    String first = line >= 0 ? r.substring(line, lineEnd >= 0 ? lineEnd : r.length()) : "";
+    for (int q = first.indexOf('"'); q >= 0;) {
+        int e = first.indexOf('"', q + 1);
+        if (e < 0) break;
+        quoted.push_back(first.substring(q + 1, e));
+        q = first.indexOf('"', e + 1);
+    }
+
+    int set = 0;
+    for (size_t i = 3; i < quoted.size() && set < 2; i++) {
+        esp_netif_dns_info_t dns;
+        if (!parseModemAddr(quoted[i], dns.ip)) continue;
+        esp_netif_set_dns_info(PPP.netif(), set == 0 ? ESP_NETIF_DNS_MAIN : ESP_NETIF_DNS_BACKUP, &dns);
+        Serial.printf("[net] DNS %d from modem: %s\n", set + 1, quoted[i].c_str());
+        set++;
+    }
+    if (set == 0) {
+        // Google's public DNS64, used only if the modem reports nothing.
+        esp_netif_dns_info_t dns = {};
+        dns.ip.type = ESP_IPADDR_TYPE_V6;
+        const uint8_t g[16] = {0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x64, 0x64};
+        memcpy(dns.ip.u_addr.ip6.addr, g, 16);
+        esp_netif_set_dns_info(PPP.netif(), ESP_NETIF_DNS_MAIN, &dns);
+        Serial.println("[net] modem reported no DNS; using 2001:4860:4860::6464");
+    }
+}
+
+// lwIP's SNTP resolves names IPv4-first, which fails on an IPv6-only link.
+// Network.hostByName() prefers AAAA once a global IPv6 exists, so resolve
+// here and hand SNTP a literal address.
+static void startSntp() {
+    static char ntpAddr[48]; // SNTP keeps the pointer
+    IPAddress ip;
+    if (!Network.hostByName("pool.ntp.org", ip)) {
+        Serial.println("[net] could not resolve pool.ntp.org; will retry");
+        return;
+    }
+    strlcpy(ntpAddr, ip.toString().c_str(), sizeof(ntpAddr));
+    configTime(0, 0, ntpAddr);
+    s_sntpStarted = true;
+}
+
+static bool pppStart() {
+    uint32_t baud = modemUartHandshake();
+    if (baud == 0) return false;
+
+    PPP.setApn(TELEMETRY_APN);
+    if (strlen(TELEMETRY_GSM_PIN)) PPP.setPin(TELEMETRY_GSM_PIN);
+    PPP.setPins(MODEM_TX_PIN, MODEM_RX_PIN); // no RTS/CTS routed on this board
+    if (!PPP.begin(PPP_MODEM_MODEL, 1, baud)) {
+        Serial.println("[net] PPP.begin failed (modem sync)");
+        return false;
+    }
+    Serial.printf("[net] modem: %s, IMEI %s\n", PPP.moduleName().c_str(), PPP.IMEI().c_str());
+
+    // Off by default in esp-netif; without them a failed PPP negotiation
+    // shows up only as "no IP", with no hint which phase died.
+    esp_netif_ppp_config_t pppCfg = {};
+    pppCfg.ppp_phase_event_enabled = true;
+    pppCfg.ppp_error_event_enabled = true;
+    esp_netif_ppp_set_params(PPP.netif(), &pppCfg);
+
+    esp_modem_PdpContext_t pdp = {1, PPP_PDP_TYPE, TELEMETRY_APN};
+    if (esp_modem_set_pdp_context(PPP.handle(), &pdp) != ESP_OK) {
+        Serial.printf("[net] modem rejected PDP type %s\n", PPP_PDP_TYPE);
+    }
+    return true;
+}
+
+static bool ensureNetworkConnected() {
+    if (PPP.connected()) return true;
+
+    if (s_pppStarted && PPP.mode() == ESP_MODEM_MODE_CMUX) {
+        // Data channel was up and has since dropped. Restarting from a hard
+        // reset is the only recovery that doesn't depend on the modem leaving
+        // CMUX cleanly.
+        Serial.println("[net] PPP link lost; resetting modem");
+        PPP.end();
+        s_pppStarted = false;
+        modemPowerPins();
+    }
+
     Serial.println("[net] (re)connecting to cellular network...");
-    // SIM_READY, not the literal 3 -- 3 is SIM_ANTITHEFT_LOCKED (TinyGsmGPRS.tpp),
-    // so the old comparison skipped the unlock only in a case that never applies.
-    if (strlen(TELEMETRY_GSM_PIN) && modem.getSimStatus() != SIM_READY) {
-        modem.simUnlock(TELEMETRY_GSM_PIN);
+    if (!s_pppStarted) {
+        s_pppStarted = pppStart();
+        if (!s_pppStarted) return false;
     }
-    if (!modem.waitForNetwork(MODEM_REGISTRATION_TIMEOUT_MS)) {
-        Serial.println("[net] network registration failed");
-        logModemDiagnostics();
+
+    uint32_t start = millis();
+    while (!PPP.attached()) {
+        if (millis() - start >= MODEM_REGISTRATION_TIMEOUT_MS) {
+            Serial.println("[net] network registration failed");
+            logModemDiagnostics();
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    if (!PPP.mode(ESP_MODEM_MODE_CMUX)) {
+        Serial.println("[net] failed to enter CMUX/PPP data mode");
         return false;
     }
-    if (!modem.gprsConnect(TELEMETRY_APN, TELEMETRY_APN_USER, TELEMETRY_APN_PASS)) {
-        Serial.println("[net] GPRS/PDP context connect failed");
+    if (!PPP.waitStatusBits(ESP_NETIF_CONNECTED_BIT, PPP_CONNECT_TIMEOUT_MS)) {
+        Serial.println("[net] PPP did not get an IP address");
+        // CMUX keeps an AT channel open, so the modem can say why the PDP
+        // context behind the PPP session didn't come up.
+        for (const char *at : {"AT+CGDCONT?", "AT+CGACT?", "AT+CGPADDR", "AT+CEER"}) {
+            String r = PPP.cmd(at, 2000);
+            r.trim();
+            r.replace("\r\n", " | ");
+            Serial.printf("[net]   %s -> %s\n", at, r.c_str());
+        }
         return false;
     }
-    Serial.println("[net] cellular network + PDP context up");
+    // IPv6 global addresses arrive by router advertisement after the link is up.
+    if (!PPP.waitStatusBits(ESP_NETIF_HAS_IP_BIT | ESP_NETIF_HAS_GLOBAL_IP6_BIT, 15000)) {
+        Serial.println("[net] PPP link up but no routable address arrived");
+        return false;
+    }
+    configureDnsFromModem();
+    String addr = PPP.hasIP() ? "IPv4 " + PPP.localIP().toString()
+                              : "IPv6 " + PPP.globalIPv6().toString();
+    Serial.printf("[net] PPP up, %s\n", addr.c_str());
+    if (!s_sntpStarted) startSntp();
     return true;
 }
 
 #if SMS_TEST_ENABLED
 // Runs once, the first time the modem is registered on the network --
-// confirms the SIM/plan can send texts at all. Deliberately gated on
-// modem.isNetworkConnected() only, not ensureNetworkConnected()'s full
-// network+GPRS bar: AT+CMGS goes out over plain network registration and
-// doesn't need the PDP context that GPRS/MQTT requires.
+// confirms the SIM/plan can send texts at all. Gated on registration only,
+// not the PPP data link: AT+CMGS goes out over plain network registration.
 static void runSmsTest() {
     static bool done = false;
-    if (done || !modem.isNetworkConnected()) return;
+    if (done || !s_pppStarted || !PPP.attached()) return;
     done = true;
 
     if (!strlen(SMS_TEST_NUMBER)) {
@@ -254,7 +446,7 @@ static void runSmsTest() {
     }
 
     Serial.printf("[sms] sending test SMS to %s...\n", SMS_TEST_NUMBER);
-    if (modem.sendSMS(SMS_TEST_NUMBER, SMS_TEST_MESSAGE)) {
+    if (PPP.sms(SMS_TEST_NUMBER, SMS_TEST_MESSAGE)) {
         Serial.println("[sms] test SMS sent");
     } else {
         Serial.println("[sms] test SMS send failed");
@@ -271,7 +463,7 @@ static bool networkBearerUp() {
     return WiFi.status() == WL_CONNECTED;
 #endif
 #else
-    return modem.isGprsConnected();
+    return PPP.connected();
 #endif
 }
 
@@ -366,18 +558,10 @@ static void spoolBatch(const String &json) {
     Serial.printf("[net] spooled batch to %s\n", path);
 }
 
-// ---- Raw (PubSubClient-bypassing) MQTT PUBLISH framing --------------------
-// PubSubClient::publish() chunks its internal write() calls to
-// MQTT_MAX_TRANSFER_SIZE (255, capped by a uint8_t inside PubSubClient itself
-// -- see platformio.ini). Each chunk is a separate AT+CCHSEND/AT+CIPSEND
-// round-trip to the modem (~30-50ms each), so a 4KB batch becomes ~16 round-
-// trips. This builds the MQTT PUBLISH packet by hand and writes it to
-// netClient in RAW_PUBLISH_CHUNK_BYTES-sized pieces, cutting the number of
-// modem round-trips ~6x. Used by both real publishes and the stress test.
-//
-// Keep RAW_PUBLISH_CHUNK_BYTES <= ~1460: SIMCom's AT command manual caps a
-// single CCHSEND/CIPSEND payload at the TCP MSS; larger sends are rejected.
-#define RAW_PUBLISH_CHUNK_BYTES 1400
+// ---- Raw MQTT PUBLISH framing ---------------------------------------------
+// Builds the whole PUBLISH packet and hands it to the socket in one write(),
+// so TLS gets full-size records and lwIP full-size segments. PubSubClient's
+// publish() would instead copy through its own buffer and split the write.
 static void mqttEncodeString(std::vector<uint8_t> &out, const char *s) {
     uint16_t len = (uint16_t)strlen(s);
     out.push_back((uint8_t)(len >> 8));
@@ -394,33 +578,18 @@ static void mqttEncodeRemainingLength(std::vector<uint8_t> &out, size_t n) {
     } while (n > 0);
 }
 
-// Sends one QoS-0 PUBLISH packet in <= chunkBytes pieces. Returns the number
-// of netClient.write() calls (each one AT+CCHSEND/AT+CIPSEND round-trip) it
-// took, or 0 if any write came up short.
-static uint32_t rawMqttPublish(const char *topic, const char *payload, size_t payloadLen,
-                                size_t chunkBytes) {
+static bool rawMqttPublish(const char *topic, const char *payload, size_t payloadLen) {
     std::vector<uint8_t> varHeader;
     mqttEncodeString(varHeader, topic);
 
-    std::vector<uint8_t> fixedHeader;
-    fixedHeader.push_back(0x30); // PUBLISH, QoS 0, no DUP/RETAIN
-    mqttEncodeRemainingLength(fixedHeader, varHeader.size() + payloadLen);
-    fixedHeader.insert(fixedHeader.end(), varHeader.begin(), varHeader.end());
+    std::vector<uint8_t> packet;
+    packet.reserve(5 + varHeader.size() + payloadLen);
+    packet.push_back(0x30); // PUBLISH, QoS 0, no DUP/RETAIN
+    mqttEncodeRemainingLength(packet, varHeader.size() + payloadLen);
+    packet.insert(packet.end(), varHeader.begin(), varHeader.end());
+    packet.insert(packet.end(), payload, payload + payloadLen);
 
-    uint32_t chunks = 0;
-    if (netClient.write(fixedHeader.data(), fixedHeader.size()) != fixedHeader.size()) return 0;
-    chunks++;
-
-    size_t offset = 0;
-    while (offset < payloadLen) {
-        size_t n = std::min(chunkBytes, payloadLen - offset);
-        if (netClient.write(reinterpret_cast<const uint8_t *>(payload) + offset, n) != n) {
-            return 0;
-        }
-        offset += n;
-        chunks++;
-    }
-    return chunks;
+    return netClient.write(packet.data(), packet.size()) == packet.size();
 }
 
 // Replays a bounded number of spooled batches per call so this never starves
@@ -472,8 +641,7 @@ static void replaySpooledBatches() {
             continue;
         }
 
-        if (rawMqttPublish(MQTT_TOPIC_TELEMETRY, payload.c_str(), payload.length(),
-                          RAW_PUBLISH_CHUNK_BYTES) > 0) {
+        if (rawMqttPublish(MQTT_TOPIC_TELEMETRY, payload.c_str(), payload.length())) {
             LittleFS.remove(path);
             replayed++;
             s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
@@ -518,18 +686,10 @@ static void runStressTest() {
     uint32_t windowBytes = 0;
     uint32_t totalBytes = 0;
     uint32_t seq = 0;
-    // Each publish is sent via rawMqttPublish(), in STRESS_RAW_CHUNK_BYTES
-    // chunks, bypassing PubSubClient's own writer (capped at 255 bytes by a
-    // uint8_t -- MQTT_MAX_TRANSFER_SIZE in platformio.ini) so this test can
-    // actually measure whether bigger AT+CCHSEND/AT+CIPSEND chunks change
-    // throughput. Timing each publish and dividing by its chunk count
-    // reveals ms/chunk at whatever STRESS_RAW_CHUNK_BYTES is set to --
-    // compare across a couple of values to see whether chunk size or a fixed
-    // per-chunk AT/modem/network round-trip cost dominates.
     uint32_t windowPublishMs = 0;
-    uint32_t windowChunks = 0;
+    uint32_t windowPublishes = 0;
     uint64_t totalPublishMs = 0;
-    uint32_t totalChunks = 0;
+    uint32_t totalPublishes = 0;
 
     while (millis() - startMs < STRESS_TEST_DURATION_S * 1000UL) {
         if (!mqtt.connected()) {
@@ -546,16 +706,15 @@ static void runStressTest() {
         json += "\"}";
 
         uint32_t pubStartMs = millis();
-        uint32_t chunks = rawMqttPublish(MQTT_TOPIC_STRESS, json.c_str(), json.length(),
-                                          RAW_PUBLISH_CHUNK_BYTES);
+        bool ok = rawMqttPublish(MQTT_TOPIC_STRESS, json.c_str(), json.length());
         uint32_t pubMs = millis() - pubStartMs;
-        if (chunks > 0) {
+        if (ok) {
             windowBytes += json.length();
             totalBytes += json.length();
             windowPublishMs += pubMs;
-            windowChunks += chunks;
+            windowPublishes++;
             totalPublishMs += pubMs;
-            totalChunks += chunks;
+            totalPublishes++;
         }
         mqtt.loop();
         yield(); // avoid starving the core-1 watchdog across a tight loop
@@ -564,16 +723,13 @@ static void runStressTest() {
         if (now - lastLogMs >= STRESS_LOG_INTERVAL_MS) {
             uint32_t windowMs = now - lastLogMs;
             uint32_t bps = (uint32_t)((uint64_t)windowBytes * 8000ULL / windowMs);
-            uint32_t msPerChunkX10 =
-                windowChunks > 0 ? (uint32_t)((uint64_t)windowPublishMs * 10 / windowChunks) : 0;
-            Serial.printf("[stress] %lu bps (target %lu), %lu.%lu ms/%d-byte chunk, "
-                          "%lu bytes so far\n",
+            uint32_t msPerPub = windowPublishes > 0 ? windowPublishMs / windowPublishes : 0;
+            Serial.printf("[stress] %lu bps (target %lu), %lu ms/publish, %lu bytes so far\n",
                           (unsigned long)bps, (unsigned long)STRESS_TARGET_BPS,
-                          (unsigned long)(msPerChunkX10 / 10), (unsigned long)(msPerChunkX10 % 10),
-                          (int)RAW_PUBLISH_CHUNK_BYTES, (unsigned long)totalBytes);
+                          (unsigned long)msPerPub, (unsigned long)totalBytes);
             windowBytes = 0;
             windowPublishMs = 0;
-            windowChunks = 0;
+            windowPublishes = 0;
             lastLogMs = now;
         }
     }
@@ -582,15 +738,12 @@ static void runStressTest() {
     uint32_t avgBps = elapsedMs > 0
                            ? (uint32_t)((uint64_t)totalBytes * 8000ULL / elapsedMs)
                            : 0;
-    uint32_t avgMsPerChunkX10 =
-        totalChunks > 0 ? (uint32_t)(totalPublishMs * 10 / totalChunks) : 0;
-    Serial.printf("[stress] done: %lu bytes over %lu ms, avg %lu bps (target %lu bps)\n",
+    uint32_t avgMsPerPub = totalPublishes > 0 ? (uint32_t)(totalPublishMs / totalPublishes) : 0;
+    Serial.printf("[stress] done: %lu bytes over %lu ms, avg %lu bps (target %lu bps), "
+                  "%lu publishes at %lu ms each\n",
                   (unsigned long)totalBytes, (unsigned long)elapsedMs,
-                  (unsigned long)avgBps, (unsigned long)STRESS_TARGET_BPS);
-    Serial.printf("[stress] avg %lu.%lu ms per <=%d-byte AT+CCHSEND/CIPSEND chunk over %lu "
-                  "chunks (RAW_PUBLISH_CHUNK_BYTES, bypassing PubSubClient's 255-byte cap)\n",
-                  (unsigned long)(avgMsPerChunkX10 / 10), (unsigned long)(avgMsPerChunkX10 % 10),
-                  (int)RAW_PUBLISH_CHUNK_BYTES, (unsigned long)totalChunks);
+                  (unsigned long)avgBps, (unsigned long)STRESS_TARGET_BPS,
+                  (unsigned long)totalPublishes, (unsigned long)avgMsPerPub);
 
     // Publish the final summary report over MQTT so it displays directly in the listener terminal
     String summaryJson = "{\"stress_summary\":true,\"total_bytes\":";
@@ -601,11 +754,10 @@ static void runStressTest() {
     summaryJson += avgBps;
     summaryJson += ",\"avg_kbps\":";
     summaryJson += (avgBps / 1000);
-    summaryJson += ",\"ms_per_chunk\":";
-    summaryJson += (avgMsPerChunkX10 / 10);
+    summaryJson += ",\"ms_per_publish\":";
+    summaryJson += avgMsPerPub;
     summaryJson += "}";
-    rawMqttPublish(MQTT_TOPIC_STRESS, summaryJson.c_str(), summaryJson.length(),
-                   RAW_PUBLISH_CHUNK_BYTES);
+    rawMqttPublish(MQTT_TOPIC_STRESS, summaryJson.c_str(), summaryJson.length());
 
     Serial.println("[stress] resuming normal telemetry publishing");
 }
@@ -630,8 +782,7 @@ static void drainAndPublish() {
     String json = telemetryFormatBatch(batch, TELEMETRY_DEVICE_ID, timeSyncEpochMsFor);
 
     if (mqtt.connected() &&
-        rawMqttPublish(MQTT_TOPIC_TELEMETRY, json.c_str(), json.length(),
-                       RAW_PUBLISH_CHUNK_BYTES) > 0) {
+        rawMqttPublish(MQTT_TOPIC_TELEMETRY, json.c_str(), json.length())) {
         Serial.printf("[net] published batch seq=%lu frames=%u dropped=%u\n",
                       (unsigned long)batch.seq, (unsigned)batch.frames.size(),
                       (unsigned)batch.dropped_frames);
@@ -653,7 +804,7 @@ static void netTask(void *) {
     }
 
 #if !TELEMETRY_USE_WIFI
-    modemPowerOn();
+    modemPowerPins();
 #if MODEM_USB_BENCH_MODE
     Serial.println("[net] MODEM_USB_BENCH_MODE=1 -- modem is powered on and idle, "
                     "UART1 will stay silent from here on. Drive it over its own "
@@ -663,6 +814,11 @@ static void netTask(void *) {
     }
 #endif
 #endif
+#if !TELEMETRY_USE_WIFI && MQTT_USE_TLS
+    // Certificate validation stays off, same as the modem-side TLS it replaces
+    // -- see MQTT_USE_TLS in telemetry_config.h.
+    netClient.setInsecure();
+#endif
     mqtt.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
     mqtt.setBufferSize(MQTT_BUFFER_SIZE);
 
@@ -671,11 +827,13 @@ static void netTask(void *) {
     Serial.println("[net] AP mode has no internet uplink; skipping NTP time sync "
                     "(inter-frame relative timing is unaffected)");
 #else
-#if TELEMETRY_USE_WIFI
-    bool timeSynced = g_timeSync.syncFromSystemClock();
-#else
-    bool timeSynced = g_timeSync.sync(modem);
-#endif
+    // SNTP was only just started by ensureNetworkConnected(); give its first
+    // reply a moment instead of waiting a full TIME_SYNC_INTERVAL_MS.
+    bool timeSynced = false;
+    for (uint32_t start = millis(); !timeSynced && millis() - start < 10000;) {
+        timeSynced = g_timeSync.syncFromSystemClock();
+        if (!timeSynced) vTaskDelay(pdMS_TO_TICKS(250));
+    }
     Serial.println(timeSynced ? "[net] initial time sync OK"
                                : "[net] initial time sync failed; will retry periodically");
 #endif
@@ -697,11 +855,10 @@ static void netTask(void *) {
 #if !(TELEMETRY_USE_WIFI && WIFI_AP_MODE)
         if (now - s_lastTimeSyncMs >= TIME_SYNC_INTERVAL_MS) {
             s_lastTimeSyncMs = now;
-#if TELEMETRY_USE_WIFI
-            if (!g_timeSync.syncFromSystemClock()) {
-#else
-            if (!g_timeSync.sync(modem)) {
+#if !TELEMETRY_USE_WIFI
+            if (!s_sntpStarted && PPP.connected()) startSntp();
 #endif
+            if (!g_timeSync.syncFromSystemClock()) {
                 Serial.println("[net] periodic time sync failed");
             }
         }
@@ -723,6 +880,7 @@ static void netTask(void *) {
 }
 
 void netTaskStart() {
-    xTaskCreatePinnedToCore(netTask, "net_task", 8192, nullptr, tskIDLE_PRIORITY + 2,
+    // TLS handshakes now run in mbedTLS on this task's stack, not in the modem.
+    xTaskCreatePinnedToCore(netTask, "net_task", 12288, nullptr, tskIDLE_PRIORITY + 2,
                              nullptr, 1);
 }
