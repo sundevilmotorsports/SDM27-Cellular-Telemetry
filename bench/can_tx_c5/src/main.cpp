@@ -202,6 +202,9 @@ static esp_err_t startNode(uint16_t sspPermill) {
 
 void setup() {
     Serial.begin(115200);
+    // Drop output instead of blocking when nothing is reading the USB port,
+    // so an unattended generator keeps pacing frames.
+    Serial.setTxTimeoutMs(0);
     delay(1500);
     Serial.printf("\n[bench] CAN FD traffic generator: %d bit/s nominal, %d bit/s data, %lu Hz\n",
                   BENCH_CAN_BITRATE, BENCH_CAN_FD_DATA_BITRATE, (unsigned long)s_rateHz);
@@ -220,6 +223,11 @@ void setup() {
         delay(2000);
     }
     Serial.printf("[can] TWAI-FD started, TX=%d RX=%d. Commands: + - p b v\n", PIN_CAN_TX, PIN_CAN_RX);
+
+    // On the bench the generator twice stopped transmitting and printing
+    // after minutes of unacknowledged retries (the S3 side was dark). Cause
+    // not yet found; until it is, reboot if loop() stalls for 5 s.
+    enableLoopWDT();
 }
 
 void loop() {
