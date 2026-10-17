@@ -30,18 +30,20 @@ real classic and CAN FD frames instead of `TELEMETRY_USE_SIMULATED_CAN=1`:
 |---|---|---|
 | 3V3 | Vcc | Match the C5's 3.3V logic. The CAN Pal's charge pump makes the transceiver's 5V. |
 | GND | GND | |
-| GPIO23 | TX | TX to TX: the labels are from the MCU's side |
-| GPIO24 | RX | |
+| GPIO4 | TX | TX to TX: the labels are from the MCU's side |
+| GPIO15 | RX | |
 | GND | SLNT | High = silent mode (can't transmit or ACK). There's no pull-down on the board, so tie it low. |
 
-GPIO23/24 are on header J3 and aren't strapping or USB pins. To use others,
-change `PIN_CAN_TX`/`PIN_CAN_RX` in [`can_tx_c5/src/main.cpp`](can_tx_c5/src/main.cpp).
+Neither GPIO4 nor GPIO15 is a strapping or USB pin. GPIO15 is only broken out
+on C5 modules without in-package PSRAM (on others it's the PSRAM chip
+select). To use other pins, change `PIN_CAN_TX`/`PIN_CAN_RX` in
+[`can_tx_c5/src/main.cpp`](can_tx_c5/src/main.cpp).
 
 ### Node B: T-SIM7670G-S3 → Soldered MCP2518 board
 
 | S3 pin | MCP2518 board pin | Notes |
 |---|---|---|
-| 5V | VCC | **Must be 5V**: feeds the ATA6561 and the board's 3.3V LDO. SPI/INT are 3.3V logic. |
+| VIN | VCC | **Must be 5V, so not 3V3.** The S3 header has no pin labeled 5V: its VIN pin is VBUS, USB-C's 5V (live only while USB-C is plugged in). VCC feeds the ATA6561 and the board's 3.3V LDO; SPI/INT stay 3.3V logic. The board's two VCC pins are tied together, so wire only one of them, and never put 3V3 on the other. |
 | GND | GND | |
 | GPIO16 | SCK | |
 | GPIO15 | SDI | S3 MOSI |
@@ -118,12 +120,14 @@ high-rate runs with `TELEMETRY_USE_WIFI=1`, not on a metered SIM.
 
 | Symptom | Likely cause |
 |---|---|
-| S3: `MCP2518FD init failed: SPI readback failed` | SCK/SDI/SDO/NCS miswired, or the board's VCC isn't 5V |
+| S3: `MCP2518FD init failed: SPI readback failed` | SCK/SDI/SDO/NCS miswired, or the board has no power |
+| S3: MCP2518FD starts fine but `rx=0` with no errors, while the C5 shows only `ack_errors` | The MCP board's VCC is on 3.3V instead of VIN. Its LDO still runs the MCP2518FD (so SPI works), but the ATA6561 needs 4.5V or more and stays off the bus. We hit exactly this |
+| C5: `bus_errors` climbing, zero `ack_errors`, then bus-off | The C5 never sees its own bits on RX: the CAN Pal is unpowered, SLNT isn't tied low, or TX/RX aren't on the pins in `PIN_CAN_TX`/`PIN_CAN_RX` |
 | C5: `ack_errors` climbing, `sent_ok=0`, `no_slot` climbing | Nobody is ACKing. Check that the S3 printed `MCP2518FD started`, CAN Pal SLNT is on GND, and CANH/CANL aren't swapped |
 | C5 `bus_errors` and/or S3 `errors=fd-crc,fd-stuff,...` | Only the 2 Mbit/s data phase is failing. Suspect wiring/termination (measure the 60Ω), or a bitrate mismatch between `can_pins.h` and `can_tx_c5/platformio.ini`. Try `-DBENCH_CAN_FD_DATA_BITRATE=1000000` and `CAN_FD_DATA_BITRATE_KBPS 1000` |
 | S3: `errors=crc,stuff,form` (no `fd-` prefix) | The arbitration phase is failing: nominal bitrate mismatch or bad wiring |
 | S3: `fifo_overflows` > 0 | The S3's CAN task fell behind the controller's 26-frame FIFO |
-| S3 `rx` climbs, but the verifier sees nothing | Network/MQTT side. Check with `python3 listener.py -b` |
+| S3 `rx` climbs, but the verifier sees nothing | Network/MQTT side: look for `[net]` lines on the S3 (e.g. `SIM: no answer -- SIM missing?`; insert the SIM before powering on), or check with `python3 listener.py -b`. Batches spool to flash meanwhile and replay once MQTT connects |
 | Verifier: `lost` > 0 and roughly equal to `device_dropped_frames` | The S3's 512-frame queue overflowed because the uplink couldn't keep up. Lower the generator rate |
 | Verifier: any `bad` frame | A real bug in the pipeline. Keep the printed frame JSON |
 

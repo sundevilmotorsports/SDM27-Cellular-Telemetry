@@ -27,9 +27,10 @@
 #endif
 
 // MCP2518 board wiring (SPI on LilyGo's SimShield header pins; GPIO1/2 are
-// free because TWAI isn't used in this mode). The board's VCC needs 5V: it
-// feeds the ATA6561 and an onboard 3.3V LDO for the MCP2518FD, so the SPI
-// and INT lines are 3.3V logic.
+// free because TWAI isn't used in this mode). The board's VCC needs 5V --
+// the S3 header's VIN (= USB VBUS), not 3V3: it feeds the ATA6561 and an
+// onboard 3.3V LDO for the MCP2518FD, so the SPI and INT lines are 3.3V
+// logic. On 3V3 the SPI side still works but the transceiver stays dark.
 #define MCP2518_SCK_PIN   16  // -> board SCK
 #define MCP2518_MOSI_PIN  15  // -> board SDI
 #define MCP2518_MISO_PIN  7   // <- board SDO

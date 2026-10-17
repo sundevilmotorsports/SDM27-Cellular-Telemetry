@@ -65,7 +65,11 @@ away without).
 
 The board needs **5V on VCC**: it feeds the ATA6561 transceiver (4.5-5.5V)
 and an onboard LDO that makes 3.3V for the MCP2518FD, whose SPI/INT pins
-are therefore 3.3V logic -- no level shifting. The SPI pins are the ones
+are therefore 3.3V logic -- no level shifting. This board's header has no
+"5V" pin: use **VIN**, which is VBUS (USB-C's 5V, live only with USB-C
+plugged in). On 3V3, SPI still works off the LDO but the ATA6561 stays off
+the bus, so the node silently receives nothing. The MCP board's two VCC pins
+are tied together: wire one, and never 3V3 to the other. The SPI pins are the ones
 LilyGo routes to its SimShield header; GPIO1/2 are free because TWAI isn't
 used in this mode. INT wakes the CAN task as frames arrive (with a 10 ms
 polling fallback).
@@ -78,7 +82,7 @@ polling fallback).
  │   GPIO7  ◄─────────┼─────────┤ SDO        CANH ─────┼──────────► CAN-H
  │   GPIO1  ──────────┼────────►│ NCS        CANL ─────┼──────────► CAN-L
  │   GPIO2  ◄─────────┼─────────┤ INT                  │
- │   5V     ──────────┼────────►│ VCC (5V)             │
+ │   VIN    ──────────┼────────►│ VCC (5V)             │
  │   GND    ──────────┼────────►│ GND                  │
  └───────────────────┘         │ INT0/INT1/CLKO: NC   │
                                 └──────────────────────┘
