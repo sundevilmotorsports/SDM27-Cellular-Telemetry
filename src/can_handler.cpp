@@ -126,24 +126,45 @@ static void IRAM_ATTR mcpIntIsr() {
     if (woken) portYIELD_FROM_ISR();
 }
 
-static void canMcpTask(void *) {
-    const Mcp2518fdPins pins = {MCP2518_SCK_PIN, MCP2518_MOSI_PIN, MCP2518_MISO_PIN, MCP2518_CS_PIN};
+static const Mcp2518fdPins kMcpPins = {MCP2518_SCK_PIN, MCP2518_MOSI_PIN, MCP2518_MISO_PIN,
+                                       MCP2518_CS_PIN};
+
+static void mcpBeginUntilOk() {
     const char *err;
-    while ((err = mcp2518fdBegin(pins, CAN_BITRATE_KBPS * 1000UL,
+    while ((err = mcp2518fdBegin(kMcpPins, CAN_BITRATE_KBPS * 1000UL,
                                  CAN_FD_DATA_BITRATE_KBPS * 1000UL)) != nullptr) {
         Serial.printf("[can] MCP2518FD init failed: %s -- retrying in 2s\n", err);
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
+}
+
+static void canMcpTask(void *) {
+    mcpBeginUntilOk();
     s_canTask = xTaskGetCurrentTaskHandle();
     pinMode(MCP2518_INT_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(MCP2518_INT_PIN), mcpIntIsr, FALLING);
     Serial.printf("[can] MCP2518FD started, %d kbit/s nominal, %d kbit/s FD data\n",
                   CAN_BITRATE_KBPS, CAN_FD_DATA_BITRATE_KBPS);
 
-    uint32_t rxCount = 0;
+    uint32_t rxCount = 0, reinits = 0;
     int64_t lastStatusUs = esp_timer_get_time();
+    int64_t lastModeCheckUs = lastStatusUs;
 
     for (;;) {
+        // A dip on the board's 5V rail (seen on the bench during modem
+        // transmit bursts, with VCC fed from the S3's USB VBUS) resets the
+        // controller into configuration mode: silent on the bus, so every
+        // other node gets ACK errors, until it is configured again.
+        if (esp_timer_get_time() - lastModeCheckUs >= 1000000) {
+            lastModeCheckUs = esp_timer_get_time();
+            if (!mcp2518fdRunning()) {
+                reinits++;
+                Serial.printf("[can] MCP2518FD left normal mode (reset/brownout on its 5V?) -- "
+                              "reinitializing (#%lu)\n", (unsigned long)reinits);
+                mcpBeginUntilOk();
+            }
+        }
+
         // Woken by INT's falling edge. INT stays low while the FIFO holds
         // anything, so a missed edge would stall reception -- the timeout
         // polls as a fallback.
@@ -175,11 +196,11 @@ static void canMcpTask(void *) {
             lastStatusUs = esp_timer_get_time();
             Mcp2518fdStatus st;
             mcp2518fdGetStatus(st);
-            Serial.printf("[can] rx=%lu state=%s rec=%u tec=%u fifo_overflows=%lu",
+            Serial.printf("[can] rx=%lu state=%s rec=%u tec=%u fifo_overflows=%lu reinits=%lu",
                           (unsigned long)rxCount,
                           st.busOff ? "bus-off" : st.rxPassive ? "error-passive"
                                                  : st.rxWarning ? "warning" : "ok",
-                          st.rec, st.tec, (unsigned long)st.rxOverflows);
+                          st.rec, st.tec, (unsigned long)st.rxOverflows, (unsigned long)reinits);
             // CiBDIAG1 flag bits 16-29: nominal-phase then data-phase errors.
             static const char *const kErr[14] = {"bit0", "bit1", "ack", "form", "stuff", "crc", "",
                                                  "txbo", "fd-bit0", "fd-bit1", "", "fd-form",

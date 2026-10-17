@@ -229,6 +229,10 @@ bool mcp2518fdRead(Mcp2518fdFrame &out) {
     return true;
 }
 
+bool mcp2518fdRunning() {
+    return mcpOpMode() == OPMODE_NORMAL_FD;
+}
+
 uint32_t mcp2518fdTimeBase() {
     return mcpReadWord(REG_CiTBC);
 }

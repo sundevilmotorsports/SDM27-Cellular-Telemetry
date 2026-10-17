@@ -46,6 +46,11 @@ const char *mcp2518fdBegin(const Mcp2518fdPins &pins, uint32_t nominalBitrate,
 // Reads the oldest frame from the RX FIFO. Returns false if it is empty.
 bool mcp2518fdRead(Mcp2518fdFrame &out);
 
+// True while the controller is in Normal CAN FD mode. False after it has
+// reset (e.g. a brownout on the board's 5V rail): it then comes back up in
+// configuration mode, silent on the bus, and needs mcp2518fdBegin() again.
+bool mcp2518fdRunning();
+
 // Current value of the controller's 1 MHz time base (same clock as
 // Mcp2518fdFrame::timestamp), for mapping timestamps onto esp_timer.
 uint32_t mcp2518fdTimeBase();
