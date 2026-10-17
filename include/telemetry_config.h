@@ -245,9 +245,16 @@
 // A wider window amortizes the per-publish overhead (MQTT header + TCP/IP
 // segment) over more frames, which matters on a metered link -- but it does
 // NOT reduce the per-frame cost, so it can't rescue a high generator rate.
-#define CAN_QUEUE_DEPTH 512   // frames; oldest dropped when full
+// The queue and window are overridable from .env for throughput testing:
+// end-to-end delivery can't exceed CAN_QUEUE_DEPTH frames per BATCH_WINDOW_MS
+// (~34 frames/s at the defaults) however fast the CAN bus or uplink is.
+#ifndef CAN_QUEUE_DEPTH
+#define CAN_QUEUE_DEPTH 512   // frames; oldest dropped when full (~40 KB, in PSRAM)
+#endif
+#ifndef BATCH_WINDOW_MS
 #define BATCH_WINDOW_MS 15000 // how often the net task drains the queue (publishing
                               // as many batches as it takes to empty it)
+#endif
 #define BATCH_MAX_FRAMES 60   // hard cap on frames per published batch
 
 // ---- Wall-clock (epoch) sync -----------------------------------------
