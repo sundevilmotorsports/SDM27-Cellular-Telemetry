@@ -45,6 +45,7 @@ static PubSubClient mqtt(netClient);
 static uint32_t s_batchSeq = 0;
 static uint32_t s_mqttBackoffMs = MQTT_BACKOFF_INITIAL_MS;
 static uint32_t s_lastMqttAttemptMs = 0;
+static int s_mqttFailStreak = 0;
 static uint32_t s_lastRegCheckMs = 0;
 static uint32_t s_lastBatchMs = 0;
 static uint32_t s_lastTimeSyncMs = 0;
@@ -467,6 +468,24 @@ static bool networkBearerUp() {
 #endif
 }
 
+#if !TELEMETRY_USE_WIFI
+// PPP.connected() only says the netif is up. On the bench a session stayed
+// "up" while passing no traffic -- every MQTT connect then timed out (rc=-2)
+// for minutes and nothing ever tore the link down. After a few straight
+// failures, log what the modem says and rebuild PPP from a modem reset.
+#define MQTT_FAILS_BEFORE_PPP_RESET 3
+
+static void restartStalePpp() {
+    Serial.printf("[net] %d MQTT connects failed over a 'connected' PPP link; resetting modem\n",
+                  MQTT_FAILS_BEFORE_PPP_RESET);
+    logModemDiagnostics();
+    PPP.end();
+    s_pppStarted = false;
+    modemPowerPins();
+    ensureNetworkConnected();
+}
+#endif
+
 // ---- MQTT with capped exponential backoff --------------------------------
 static bool mqttConnectAttempt() {
     char clientId[48];
@@ -499,9 +518,17 @@ static void maintainMqtt() {
     if (mqttConnectAttempt()) {
         Serial.println("[net] MQTT connected");
         s_mqttBackoffMs = MQTT_BACKOFF_INITIAL_MS;
+        s_mqttFailStreak = 0;
     } else {
         Serial.printf("[net] MQTT connect failed, rc=%d\n", mqtt.state());
         s_mqttBackoffMs = std::min<uint32_t>(s_mqttBackoffMs * 2, MQTT_BACKOFF_MAX_MS);
+#if !TELEMETRY_USE_WIFI
+        if (++s_mqttFailStreak >= MQTT_FAILS_BEFORE_PPP_RESET) {
+            s_mqttFailStreak = 0;
+            s_mqttBackoffMs = MQTT_BACKOFF_INITIAL_MS;
+            restartStalePpp();
+        }
+#endif
     }
 }
 
