@@ -24,11 +24,12 @@
 #include <esp_twai_onchip.h>
 #include <atomic>
 
-// ---- Pins (ESP32-C5-DevKitC-1, header J3) ----------------------------------
-// TWAI goes through the GPIO matrix, so any free pin works. These avoid the
-// C5's strapping pins (2, 3, 7, 25, 26, 27, 28) and USB (13, 14).
-#define PIN_CAN_TX 23  // -> CAN Pal TX
-#define PIN_CAN_RX 24  // <- CAN Pal RX
+// ---- Pins (ESP32-C5-DevKitC-1, as wired on the bench) ----------------------
+// TWAI goes through the GPIO matrix, so any free pin works. Neither is a C5
+// strapping pin (2, 3, 7, 25, 26, 27, 28) or USB (13, 14). GPIO15 only
+// exists on module variants without in-package PSRAM (it's PSRAM CS on others).
+#define PIN_CAN_TX 4   // -> CAN Pal TX
+#define PIN_CAN_RX 15  // <- CAN Pal RX
 
 #ifndef BENCH_CAN_BITRATE
 #define BENCH_CAN_BITRATE 500000
@@ -56,13 +57,14 @@ static TxSlot s_pool[TX_POOL];
 static uint32_t s_submitted = 0;
 static SemaphoreHandle_t s_freeSlots;
 static std::atomic<uint32_t> s_txOk{0}, s_txFailed{0}, s_ackErrors{0}, s_busErrors{0};
+static std::atomic<bool> s_busOff{false};
 
 static uint8_t s_seq = 0;
-static uint32_t s_queued = 0, s_noSlot = 0;
+static uint32_t s_queued = 0, s_noSlot = 0, s_busOffSkips = 0;
 static uint32_t s_rateHz = BENCH_TX_RATE_HZ;
 static bool s_paused = false, s_verbose = false;
 
-// Both callbacks run in ISR context.
+// All callbacks run in ISR context.
 static bool onTxDone(twai_node_handle_t, const twai_tx_done_event_data_t *e, void *) {
     (e->is_tx_success ? s_txOk : s_txFailed)++;
     BaseType_t woken = pdFALSE;
@@ -73,6 +75,11 @@ static bool onTxDone(twai_node_handle_t, const twai_tx_done_event_data_t *e, voi
 static bool onError(twai_node_handle_t, const twai_error_event_data_t *e, void *) {
     if (e->err_flags.ack_err) s_ackErrors++;
     if (e->err_flags.bit_err || e->err_flags.form_err || e->err_flags.stuff_err) s_busErrors++;
+    return false;
+}
+
+static bool onStateChange(twai_node_handle_t, const twai_state_change_event_data_t *e, void *) {
+    s_busOff = e->new_sta == TWAI_ERROR_BUS_OFF;
     return false;
 }
 
@@ -92,6 +99,10 @@ static uint8_t frameCrc(uint32_t id, bool ext, bool fd, bool brs, uint8_t len, c
 
 // waitMs = how long to wait for a free slot; 0 for the paced loop.
 static bool sendRandomFrame(uint32_t waitMs) {
+    if (s_busOff) {  // the driver rejects transmits until printStatus() recovers the node
+        s_busOffSkips++;
+        return false;
+    }
     if (xSemaphoreTake(s_freeSlots, pdMS_TO_TICKS(waitMs)) != pdTRUE) {
         s_noSlot++;  // all TX_POOL frames still in flight: almost always "nobody is ACKing"
         return false;
@@ -142,16 +153,22 @@ static void printStatus() {
     if (twai_node_get_info(s_node, &st, &rec) != ESP_OK) return;
     static const char *const kState[] = {"ok", "warning", "error-passive", "bus-off"};
     Serial.printf("[status] queued=%lu sent_ok=%lu seq=%u rate=%luHz%s state=%s tec=%u rec=%u "
-                  "ack_errors=%lu bus_errors=%lu no_slot=%lu\n",
+                  "ack_errors=%lu bus_errors=%lu no_slot=%lu bus_off_skips=%lu\n",
                   (unsigned long)s_queued, (unsigned long)s_txOk.load(), s_seq,
                   (unsigned long)s_rateHz, s_paused ? " (paused)" : "",
                   st.state <= TWAI_ERROR_BUS_OFF ? kState[st.state] : "?", st.tx_error_count,
                   st.rx_error_count, (unsigned long)s_ackErrors.load(),
-                  (unsigned long)s_busErrors.load(), (unsigned long)s_noSlot);
+                  (unsigned long)s_busErrors.load(), (unsigned long)s_noSlot,
+                  (unsigned long)s_busOffSkips);
     if (s_ackErrors.load() && s_txOk.load() == 0) {
         Serial.println("         ^ no ACKs: is the S3 running with TELEMETRY_USE_SIMULATED_CAN=0 and its "
                        "MCP2518FD initialized ([can] MCP2518FD started)? Also check CAN Pal SLNT is tied "
                        "to GND and CANH/CANL aren't swapped.");
+    }
+    if (s_busErrors.load() && s_txOk.load() == 0 && s_ackErrors.load() == 0) {
+        Serial.printf("         ^ bit errors with no ACK errors: the C5 never sees its own bits on RX. "
+                      "Check the CAN Pal has power (Vcc=3V3, GND), SLNT is tied to GND, and its "
+                      "TX/RX go to GPIO%d/GPIO%d.\n", PIN_CAN_TX, PIN_CAN_RX);
     }
     if (st.state == TWAI_ERROR_BUS_OFF) {
         Serial.println("[status] bus-off, recovering");
@@ -178,6 +195,7 @@ static esp_err_t startNode(uint16_t sspPermill) {
     twai_event_callbacks_t cbs = {};
     cbs.on_tx_done = onTxDone;
     cbs.on_error = onError;
+    cbs.on_state_change = onStateChange;
     if ((err = twai_node_register_event_callbacks(s_node, &cbs, nullptr)) != ESP_OK) return err;
     return twai_node_enable(s_node);
 }
