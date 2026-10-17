@@ -131,13 +131,32 @@ static void canTwaiTask(void *) {
     Serial.printf("[can] TWAI started, TX=%d RX=%d, %d kbit/s\n", CAN_TX_PIN, CAN_RX_PIN,
                   CAN_BITRATE_KBPS);
 
+    uint32_t rxCount = 0;
+    int64_t lastStatusUs = esp_timer_get_time();
+
     for (;;) {
+        // Periodic bus health line, so a silent bench can be split into
+        // "nothing on the wire" (rx=0, no errors) vs "frames arriving but
+        // malformed" (bus errors climbing, e.g. bitrate mismatch).
+        if (esp_timer_get_time() - lastStatusUs >= 5000000) {
+            lastStatusUs = esp_timer_get_time();
+            twai_status_info_t st;
+            if (twai_get_status_info(&st) == ESP_OK) {
+                static const char *const kState[] = {"stopped", "running", "bus-off", "recovering"};
+                Serial.printf("[can] rx=%lu state=%s rec=%lu bus_errors=%lu rx_missed=%lu rx_overrun=%lu\n",
+                              (unsigned long)rxCount, st.state <= 3 ? kState[st.state] : "?",
+                              (unsigned long)st.rx_error_counter, (unsigned long)st.bus_error_count,
+                              (unsigned long)st.rx_missed_count, (unsigned long)st.rx_overrun_count);
+            }
+        }
+
         twai_message_t msg;
         // Block up to 100ms for a frame; this keeps the task off the run
         // queue between frames without ever blocking on network state.
         if (twai_receive(&msg, pdMS_TO_TICKS(100)) != ESP_OK) {
             continue;
         }
+        rxCount++;
         // Timestamp captured immediately after the frame leaves the driver,
         // before it touches the queue.
         int64_t capture_us = esp_timer_get_time();
