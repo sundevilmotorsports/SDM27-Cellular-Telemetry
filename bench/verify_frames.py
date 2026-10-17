@@ -74,6 +74,10 @@ class Verifier:
         self.fd_brs = 0
         self.lengths = {}
         self.latencies_ms = []
+        self.mqtt_bytes = 0      # JSON payload bytes received
+        self.can_bytes = 0       # CAN data bytes in CRC-verified frames
+        self.first_recv_ms = None
+        self.last_recv_ms = None
         self.last_batch_seq = None
         self.last_frame_seq = None
 
@@ -84,11 +88,15 @@ class Verifier:
             if self.bad == self.show_failures:
                 print("  [FAIL] (further failures counted but not printed)")
 
-    def batch(self, msg: dict, recv_ms: int):
+    def batch(self, msg: dict, recv_ms: int, nbytes: int = 0):
         frames = msg.get("frames")
         if not isinstance(frames, list):
             return  # stress-test or other non-batch message
         self.batches += 1
+        self.mqtt_bytes += nbytes
+        if self.first_recv_ms is None:
+            self.first_recv_ms = recv_ms
+        self.last_recv_ms = recv_ms
         self.device_dropped += int(msg.get("dropped_frames", 0))
 
         # Live batches arrive with increasing seq. A lower one is either a
@@ -146,6 +154,7 @@ class Verifier:
         self.fd_brs += brs
         self.classic += not fd
         self.lengths[dlc] = self.lengths.get(dlc, 0) + 1
+        self.can_bytes += dlc
         if "ts_ms" in f:
             self.latencies_ms.append(recv_ms - int(f["ts_ms"]))
 
@@ -165,6 +174,16 @@ class Verifier:
             f"lost(seq gaps)={self.lost} device_dropped_frames={self.device_dropped} "
             f"out_of_order_batches={self.out_of_order_batches} s3_restarts={self.restarts}",
         ]
+        # Delivered throughput between the first and last batch to arrive.
+        # Batches land in bursts once per window, so this needs a run several
+        # windows long to mean much.
+        if self.first_recv_ms is not None and self.last_recv_ms > self.first_recv_ms:
+            span = (self.last_recv_ms - self.first_recv_ms) / 1000
+            lines.append(
+                f"throughput over {span:.0f}s: {self.crc_ok / span:.1f} frames/s, "
+                f"CAN payload {self.can_bytes * 8 / span / 1000:.1f} kbit/s, "
+                f"MQTT JSON {self.mqtt_bytes * 8 / span / 1000:.1f} kbit/s "
+                f"({self.mqtt_bytes / 1e6:.2f} MB total)")
         lat = self.latencies_ms[-1000:]
         if lat:
             med = statistics.median(lat)
@@ -271,7 +290,7 @@ def main():
             parsed = json.loads(msg.payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return
-        v.batch(parsed, int(time.time() * 1000))
+        v.batch(parsed, int(time.time() * 1000), len(msg.payload))
         if time.monotonic() - last_summary >= args.every:
             last_summary = time.monotonic()
             print(f"[summary] {v.summary()}")
