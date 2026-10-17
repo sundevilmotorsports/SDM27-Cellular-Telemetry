@@ -20,7 +20,7 @@ String telemetryFormatBatch(const TelemetryBatch &batch, const char *device_id,
     doc["dropped_frames"] = batch.dropped_frames;
 
     JsonArray frames = doc["frames"].to<JsonArray>();
-    char hexbuf[17];
+    char hexbuf[CAN_MAX_DATA_LEN * 2 + 1];
     for (const CanFrame &f : batch.frames) {
         JsonObject jf = frames.add<JsonObject>();
         jf["can_id"] = f.id;
@@ -29,6 +29,10 @@ String telemetryFormatBatch(const TelemetryBatch &batch, const char *device_id,
         hexEncode(f.data, f.dlc, hexbuf);
         jf["data"] = hexbuf;
         jf["ts_ms"] = epoch_ms_for(f.capture_us);
+        if (f.fd) {
+            jf["fd"] = true;
+            jf["brs"] = f.brs;
+        }
     }
 
     String out;
