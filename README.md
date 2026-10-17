@@ -128,6 +128,28 @@ pins 5 and 8 are simply not connected.
 - **This module has no onboard CAN transceiver** -- the wiring above is
   external, on a breadboard/protoboard, not part of the LilyGo PCB.
 
+## Bench wiring reference (all pins)
+
+| From | Pin | To | Pin |
+|---|---|---|---|
+| T-SIM7670G-S3 | GPIO16 | MCP2518 board | SCK |
+| T-SIM7670G-S3 | GPIO15 | MCP2518 board | SDI |
+| T-SIM7670G-S3 | GPIO7 | MCP2518 board | SDO |
+| T-SIM7670G-S3 | GPIO1 | MCP2518 board | NCS |
+| T-SIM7670G-S3 | GPIO2 | MCP2518 board | INT |
+| T-SIM7670G-S3 | VIN (= USB VBUS 5V) | MCP2518 board | one VCC pin only (never 3V3) |
+| T-SIM7670G-S3 | GND | MCP2518 board | GND |
+| ESP32-C5-DevKitC-1 | GPIO4 | CAN Pal | TX |
+| ESP32-C5-DevKitC-1 | GPIO15 | CAN Pal | RX |
+| ESP32-C5-DevKitC-1 | 3V3 | CAN Pal | Vcc |
+| ESP32-C5-DevKitC-1 | GND | CAN Pal | GND and SLNT |
+| CAN Pal | H / L / GND | MCP2518 board | CANH / CANL / GND |
+
+Termination: MCP2518 JP1 solder-bridged and CAN Pal switch ON, giving ~60 Ω
+across CANH/CANL. Bus: 500 kbit/s nominal, 2 Mbit/s FD data. USB ports on
+the Mac: S3 = `/dev/cu.usbmodem101`, C5 = `/dev/cu.usbmodem1101` (native
+USB on both). Test procedure, results and open issues: [bench/README.md](bench/README.md).
+
 ## Architecture
 
 Two FreeRTOS tasks + one shared queue, exactly matching the CAN task's output

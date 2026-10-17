@@ -131,6 +131,42 @@ high-rate runs with `TELEMETRY_USE_WIFI=1`, not on a metered SIM.
 | Verifier: `lost` > 0 and roughly equal to `device_dropped_frames` | The S3's 512-frame queue overflowed because the uplink couldn't keep up. Lower the generator rate |
 | Verifier: any `bad` frame | A real bug in the pipeline. Keep the printed frame JSON |
 
+## Bench results and open issues (2026-10-17)
+
+**Verified on hardware:**
+- CAN at 10 frames/s, 500k/2M FD: about 950 frames over 95 s with zero bus
+  errors on either node.
+- End to end over LTE: 320/320 frames reached HiveMQ with valid CRCs (classic,
+  FD and FD+BRS, every length 2-64 bytes). Verdict PASS, with 1 frame lost
+  to an MCP2518 FIFO overflow at boot.
+
+**Open issues, not yet fixed or verified:**
+1. **The MCP2518 resets under modem transmit bursts.** With its VCC on the
+   S3's VIN, it reset into config mode right after back-to-back publishes:
+   TREC showed TXBO with TEC/REC = 0, and the C5 got only ACK errors. The S3
+   now re-initializes it within ~1 s (`reinits=` in the `[can]` line). That
+   fix is committed but untested on hardware. Real fix: a stiffer 5V for the
+   board. Try the C5's 5V pin (J1-14, shared GND) or a bulk capacitor
+   (≥470 µF) at the board's VCC.
+2. **The C5 sender hangs** (stops transmitting and printing) after minutes of
+   unacknowledged retries while the S3 side is dark. Cause unknown. It now
+   has `setTxTimeoutMs(0)` and a 5 s loop watchdog, both committed but not
+   flashed or tested.
+3. **MQTT died after a burst of publishes**, and every reconnect timed out
+   (`rc=-2`) while PPP still reported connected. The S3 now resets the modem
+   after 3 straight failures (committed, not yet tested). Possibly the same
+   power dip as issue 1.
+4. **The max-speed test was not run.** For the CAN ceiling, set the C5 to
+   2000 Hz (`+` x8) and compare its `sent_ok` with the S3's `rx`. For the
+   uplink ceiling, add `CAN_QUEUE_DEPTH=4096` and `BATCH_WINDOW_MS=1000` to
+   `.env`; the defaults cap delivery at 512 frames / 15 s (~34 frames/s).
+   The verifier prints throughput.
+5. After changing `.env` or build flags, the first S3 build can report
+   FAILED while pioarduino rebuilds the framework. Run it again. If a build
+   is interrupted, `~/.platformio/packages/framework-arduinoespressif32-libs`
+   can be left half-deleted ("MissingPackageManifestError"): delete it and
+   rebuild.
+
 ## Why not Soldered's Arduino library
 
 The S3 talks to the MCP2518FD through a small register-level driver
