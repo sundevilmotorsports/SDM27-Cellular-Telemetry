@@ -764,33 +764,66 @@ static void runStressTest() {
 #endif
 
 // ---- Batch drain + publish ------------------------------------------------
-static void drainAndPublish() {
+// Builds and publishes one batch of at most maxFrames frames, also capped by
+// BATCH_MAX_FRAMES and by serialized size: replaySpooledBatches() discards
+// any spooled batch larger than MQTT_BUFFER_SIZE, and with 64-byte CAN FD
+// frames a frame-count cap alone would overshoot it ~2x. Returns the number
+// of frames taken off the queue, or -1 if the publish failed (batch spooled).
+static int publishOneBatch(int maxFrames) {
+    // Batch header (device_id, seq, dropped_frames, brackets) plus the
+    // topic and the replay check's own margin.
+    static const size_t kBudget = MQTT_BUFFER_SIZE - strlen(MQTT_TOPIC_TELEMETRY) - 16 -
+                                  strlen(TELEMETRY_DEVICE_ID) - 96;
+
     TelemetryBatch batch;
-    batch.seq = s_batchSeq++;
     batch.dropped_frames = canHandlerTakeDroppedCount();
 
+    size_t bytes = 0;
     CanFrame f;
-    while ((int)batch.frames.size() < BATCH_MAX_FRAMES &&
-           xQueueReceive(g_canQueue, &f, 0) == pdTRUE) {
+    while ((int)batch.frames.size() < std::min(maxFrames, BATCH_MAX_FRAMES) &&
+           xQueuePeek(g_canQueue, &f, 0) == pdTRUE) {
+        size_t frameBytes = telemetryFrameJsonMaxBytes(f);
+        if (!batch.frames.empty() && bytes + frameBytes > kBudget) break;
+        xQueueReceive(g_canQueue, &f, 0); // sole consumer: this is the frame just peeked
         batch.frames.push_back(f);
+        bytes += frameBytes;
     }
 
     if (batch.frames.empty() && batch.dropped_frames == 0) {
-        return; // nothing to report this window
+        return 0; // nothing to report this window
     }
+    batch.seq = s_batchSeq++;
 
     String json = telemetryFormatBatch(batch, TELEMETRY_DEVICE_ID, timeSyncEpochMsFor);
 
     if (mqtt.connected() &&
         rawMqttPublish(MQTT_TOPIC_TELEMETRY, json.c_str(), json.length())) {
-        Serial.printf("[net] published batch seq=%lu frames=%u dropped=%u\n",
+        Serial.printf("[net] published batch seq=%lu frames=%u bytes=%u dropped=%u\n",
                       (unsigned long)batch.seq, (unsigned)batch.frames.size(),
-                      (unsigned)batch.dropped_frames);
-    } else {
-        Serial.printf("[net] publish failed (connected=%d), spooling seq=%lu\n",
-                      mqtt.connected(), (unsigned long)batch.seq);
-        spoolBatch(json);
+                      (unsigned)json.length(), (unsigned)batch.dropped_frames);
+        return (int)batch.frames.size();
     }
+    Serial.printf("[net] publish failed (connected=%d), spooling seq=%lu\n",
+                  mqtt.connected(), (unsigned long)batch.seq);
+    spoolBatch(json);
+    return -1;
+}
+
+// Publishes everything that was queued when the window opened, in as many
+// batches as it takes. One capped batch per window bounded sustained
+// throughput at BATCH_MAX_FRAMES / BATCH_WINDOW_MS (4 frames/s at the
+// defaults) however fast the uplink was, silently overflowing the queue
+// above that. Frames arriving mid-drain wait for the next window, so a bus
+// faster than the uplink can't pin the net task here; and the first failed
+// publish stops the drain, so an outage still spools one batch per window.
+static void drainAndPublish() {
+    int pending = (int)uxQueueMessagesWaiting(g_canQueue);
+    do {
+        int taken = publishOneBatch(pending);
+        if (taken <= 0) break;
+        pending -= taken;
+        mqtt.loop();
+    } while (pending > 0);
 }
 
 // ---- Task ------------------------------------------------------------

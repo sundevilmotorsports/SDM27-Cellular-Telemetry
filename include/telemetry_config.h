@@ -222,10 +222,11 @@
 #define MQTT_TOPIC_STRESS MQTT_TOPIC_TELEMETRY "/stress"
 #endif
 #define MQTT_CLIENT_ID_PREFIX "esp32-can-telemetry-"
-// Must comfortably fit BATCH_MAX_FRAMES worth of serialized JSON (~110
-// bytes/frame). PubSubClient allocates this on the regular heap, not PSRAM --
-// if you raise BATCH_MAX_FRAMES, raise this too and watch for allocation
-// failures at boot.
+// Upper bound on one published batch: the net task stops adding frames to a
+// batch before its JSON would exceed this (~110 bytes per classic frame, up
+// to ~240 per 64-byte CAN FD frame), and spool replay discards anything
+// larger. PubSubClient allocates this on the regular heap, not PSRAM -- if
+// you raise it, watch for allocation failures at boot.
 #define MQTT_BUFFER_SIZE 8192
 
 // A stress publish is a device_id/seq header plus a STRESS_FILLER_BYTES
@@ -245,7 +246,8 @@
 // segment) over more frames, which matters on a metered link -- but it does
 // NOT reduce the per-frame cost, so it can't rescue a high generator rate.
 #define CAN_QUEUE_DEPTH 512   // frames; oldest dropped when full
-#define BATCH_WINDOW_MS 15000 // how often the net task drains the queue
+#define BATCH_WINDOW_MS 15000 // how often the net task drains the queue (publishing
+                              // as many batches as it takes to empty it)
 #define BATCH_MAX_FRAMES 60   // hard cap on frames per published batch
 
 // ---- Wall-clock (epoch) sync -----------------------------------------
