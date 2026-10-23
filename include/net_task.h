@@ -1,6 +1,6 @@
-// Owns the modem, MQTT connection, and all reconnect/backoff/retry logic.
+// Owns the modem, the HTTPS POST path, and spool replay.
 // Drains the shared CAN queue into time-windowed batches, serializes them,
-// and publishes over MQTT via the LTE link. Never touches CAN capture timing.
+// and POSTs the JSON to HTTPS_INGEST_URL. Never touches CAN capture timing.
 
 #pragma once
 
