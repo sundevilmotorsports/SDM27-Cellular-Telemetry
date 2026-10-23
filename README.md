@@ -418,6 +418,45 @@ and replug without touching the button before assuming something's wrong.
 **This also spends real billed data on a metered SIM, same as the firmware
 stress test** -- there is no dry-run mode here either.
 
+## Throughput and bottlenecks
+
+Measured on the bench, 2026-10-22: MCP2518FD at 500 kbit/s arbitration /
+2 Mbit/s FD data, LTE uplink, MQTT over TLS. Details are in
+[bench/README.md](bench/README.md#bench-results-2026-10-22).
+
+| Stage | Frames/s | Throughput | Limit |
+|---|---|---|---|
+| CAN bus into the S3 | ~4,700 max (2,000 sustained, 0 errors) | ~525 kbit/s of CAN payload | Bus bit rates (bus saturated) |
+| S3 to modem to broker | **605** | 553 kbit/s of JSON = **68 kbit/s of CAN payload** | ESP32-to-modem UART (921,600 baud = 737 kbit/s raw) |
+
+The uplink pipe is full, but mostly with JSON overhead: a frame with ~14
+bytes of data costs ~115 bytes of JSON (hex doubles every byte, and field
+names and a 13-digit timestamp repeat per frame). Carrying the bus's full
+525 kbit/s of payload as JSON would need ~4.2 Mbit/s of uplink, about 6x
+the UART. The bottlenecks, in order:
+
+1. **JSON encoding (~8x the raw payload).** This is the biggest lever. A
+   compact layout (one batch base timestamp plus per-frame ms deltas,
+   positional arrays, base64 data) measures ~2.5-3x. A binary format
+   (CBOR/protobuf) is ~1.5-2x.
+2. **ESP32-to-modem UART, 737 kbit/s raw.** PPP/TCP/TLS framing leaves ~75%
+   for payload. Raising `MODEM_TARGET_BAUDRATE` lifts it, but the board has
+   no RTS/CTS, so byte loss at higher rates needs testing.
+3. **Default batching caps delivery at ~34 frames/s** (`CAN_QUEUE_DEPTH`
+   512 per `BATCH_WINDOW_MS` 15 s), deliberately, to bound cellular data
+   cost. Both are `.env`-overridable. The 605 frames/s figure used 4096 /
+   1000 ms.
+4. **Offline spooling** stalls the CPUs during each LittleFS write, which
+   drops a few frames at ~2,000 frames/s (the MCP2518's 26-frame FIFO lasts
+   13 ms). There's no flash writing while online.
+
+Not bottlenecks: the CAN bus at realistic loads (real vehicles typically
+run at 20-50% bus load), the LTE link itself (the SIM7670G is Cat-1,
+~5 Mbit/s up), and the MQTT broker (HiveMQ took 553 kbit/s with zero bad
+frames). Switching MQTT to HTTPS doesn't remove any of the above, and
+per-request headers and round trips add cost unless the TLS connection is
+reused across POSTs.
+
 ## Known limitations
 
 - **Timestamp accuracy** is bounded by SNTP over the cellular link --
@@ -433,10 +472,10 @@ stress test** -- there is no dry-run mode here either.
   `SPOOL_MAX_FILES` (oldest dropped beyond that). This is not a durable,
   unbounded store-and-forward system -- a very long outage will still lose
   the oldest spooled data.
-- **JSON bandwidth overhead.** At full detail, JSON costs roughly 2-3x the
-  bytes of a packed binary format per frame. Fine for a PoC on a Cat-1 link
-  at moderate frame rates; a production version should switch to CBOR or
-  protobuf.
+- **JSON bandwidth overhead.** The current per-frame JSON measures ~7.5-10x
+  the raw CAN payload (~115 bytes for a ~14-byte frame), which makes it the
+  main uplink bottleneck (see [Throughput and bottlenecks](#throughput-and-bottlenecks)).
+  A compact JSON layout or a binary format (CBOR/protobuf) cuts that 3-5x.
 - **No production security hardening, OTA, or fleet management.** MQTT
   credentials are broker auth only (no TLS configured by default, no
   device-cert-based mTLS); this is explicitly out of scope for the PoC.
