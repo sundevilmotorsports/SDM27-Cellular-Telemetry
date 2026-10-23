@@ -131,41 +131,49 @@ high-rate runs with `TELEMETRY_USE_WIFI=1`, not on a metered SIM.
 | Verifier: `lost` > 0 and roughly equal to `device_dropped_frames` | The S3's 512-frame queue overflowed because the uplink couldn't keep up. Lower the generator rate |
 | Verifier: any `bad` frame | A real bug in the pipeline. Keep the printed frame JSON |
 
-## Bench results and open issues (2026-10-17)
+## Bench results (2026-10-22)
 
-**Verified on hardware:**
-- CAN at 10 frames/s, 500k/2M FD: about 950 frames over 95 s with zero bus
-  errors on either node.
-- End to end over LTE: 320/320 frames reached HiveMQ with valid CRCs (classic,
-  FD and FD+BRS, every length 2-64 bytes). Verdict PASS, with 1 frame lost
-  to an MCP2518 FIFO overflow at boot.
+All on hardware: S3 + MCP2518 board (VCC from S3 VIN), C5 + CAN Pal, 500 kbit/s
+arbitration / 2 Mbit/s FD data, LTE uplink to HiveMQ Cloud over TLS.
 
-**Open issues, not yet fixed or verified:**
-1. **The MCP2518 resets under modem transmit bursts.** With its VCC on the
-   S3's VIN, it reset into config mode right after back-to-back publishes:
-   TREC showed TXBO with TEC/REC = 0, and the C5 got only ACK errors. The S3
-   now re-initializes it within ~1 s (`reinits=` in the `[can]` line). That
-   fix is committed but untested on hardware. Real fix: a stiffer 5V for the
-   board. Try the C5's 5V pin (J1-14, shared GND) or a bulk capacitor
-   (≥470 µF) at the board's VCC.
-2. **The C5 sender hangs** (stops transmitting and printing) after minutes of
-   unacknowledged retries while the S3 side is dark. Cause unknown. It now
-   has `setTxTimeoutMs(0)` and a 5 s loop watchdog, both committed but not
-   flashed or tested.
-3. **MQTT died after a burst of publishes**, and every reconnect timed out
-   (`rc=-2`) while PPP still reported connected. The S3 now resets the modem
-   after 3 straight failures (committed, not yet tested). Possibly the same
-   power dip as issue 1.
-4. **The max-speed test was not run.** For the CAN ceiling, set the C5 to
-   2000 Hz (`+` x8) and compare its `sent_ok` with the S3's `rx`. For the
-   uplink ceiling, add `CAN_QUEUE_DEPTH=4096` and `BATCH_WINDOW_MS=1000` to
-   `.env`; the defaults cap delivery at 512 frames / 15 s (~34 frames/s).
-   The verifier prints throughput.
-5. After changing `.env` or build flags, the first S3 build can report
-   FAILED while pioarduino rebuilds the framework. Run it again. If a build
-   is interrupted, `~/.platformio/packages/framework-arduinoespressif32-libs`
-   can be left half-deleted ("MissingPackageManifestError"): delete it and
-   rebuild.
+| Test | Result |
+|---|---|
+| End-to-end content, 10 frames/s, 90 s | **PASS**: 1,146/1,146 frames verified (classic, FD, FD+BRS, every length 2-64 B), 0 lost |
+| CAN sustained, C5 at 2,000 frames/s | S3 received 2,000 frames/s, 0 bus errors, 0 FIFO overflows (~224 kbit/s of CAN payload, ~50% bus load) |
+| CAN ceiling, back-to-back bursts | ~4,700 frames/s (5,000 frames in 1.07 s, all received), ~525 kbit/s payload, bus ~saturated |
+| Uplink ceiling, C5 at 2,000/s, `CAN_QUEUE_DEPTH=4096`, `BATCH_WINDOW_MS=1000` | **605 frames/s delivered**, 553 kbit/s of MQTT JSON (68 kbit/s of it CAN payload), median latency 3.0 s; all 71,108 delivered frames passed CRC; excess dropped at the S3 queue as designed |
+| MCP2518 brownout recovery (reset injected, recovery held off 5 min) | S3 re-initialized it within 1 s once allowed; traffic resumed |
+| C5 under 5 min of no-ACK, port read and unread | No hang, no watchdog reboot, resumed instantly |
+
+The uplink ceiling is the ESP32-to-modem serial link (921,600 baud = 737
+kbit/s raw), not LTE: 553 kbit/s is ~75% of it after PPP/TCP/TLS framing.
+JSON is ~8x the raw CAN payload, so a binary format is the lever for more
+frames/s. With default batching (512-frame queue, 15 s window), delivery
+caps at ~34 frames/s by design.
+
+**Still open:**
+1. **Offline spooling drops a few frames at high rates.** Each LittleFS write
+   (one per window while MQTT is down) stalls the S3's CPUs longer than the
+   MCP2518's 26-frame FIFO lasts at 2,000 frames/s: 2-4 overflow events,
+   roughly 2 frames lost per write. No flash writes happen while online.
+2. **MCP2518 resets from 5V dips** were seen on 2026-10-17 but not
+   reproduced today, even at full modem load (could be a different S3
+   board). The auto-recovery covers it. A steadier 5V (C5's 5V pin, or
+   ≥470 µF at the board's VCC) is still the real fix.
+3. **The C5 hang from 2026-10-17 didn't reproduce** after the non-blocking
+   serial change. The 5 s loop watchdog stays as a backstop.
+4. **The stale-PPP modem reset** (3 straight MQTT failures while PPP says
+   up) hasn't been triggered on hardware yet: MQTT never dropped today.
+
+**Tooling notes:**
+- Homebrew's Python may lack the deps. Use the repo's `.venv`:
+  `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`,
+  then `.venv/bin/python bench/verify_frames.py`.
+- The first S3 build after an `.env` change usually reports FAILED once or
+  twice while pioarduino rebuilds the framework. Just rerun it. If a build is
+  interrupted, `~/.platformio/packages/framework-arduinoespressif32-libs`
+  can be left half-deleted ("MissingPackageManifestError"): delete it and
+  rebuild.
 
 ## Why not Soldered's Arduino library
 
