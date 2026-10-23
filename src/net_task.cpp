@@ -461,6 +461,25 @@ static bool networkBearerUp() {
 #endif
 }
 
+#if !TELEMETRY_USE_WIFI
+// PPP.connected() only says the netif is up. On the bench a session stayed
+// "up" while passing no traffic -- every connect then timed out for minutes
+// and nothing ever tore the link down. After a few straight POSTs that fail
+// to connect, log what the modem says and rebuild PPP from a modem reset.
+#define POST_FAILS_BEFORE_PPP_RESET 3
+static int s_postFailStreak = 0;
+
+static void restartStalePpp() {
+    Serial.printf("[net] %d POSTs failed over a 'connected' PPP link; resetting modem\n",
+                  POST_FAILS_BEFORE_PPP_RESET);
+    logModemDiagnostics();
+    PPP.end();
+    s_pppStarted = false;
+    modemPowerPins();
+    ensureNetworkConnected();
+}
+#endif
+
 // ---- HTTPS POST ---------------------------------------------------------
 // There is no session to maintain. Each batch is one POST; the status line is
 // the ack MQTT QoS 0 never gave. 2xx means stored. 409 means a unique
@@ -494,6 +513,15 @@ static int httpPostJson(const char *json, size_t len) {
     http.addHeader("Prefer", "return=minimal");
     int code = http.POST(reinterpret_cast<uint8_t *>(const_cast<char *>(json)), len);
     http.end();
+#if !TELEMETRY_USE_WIFI
+    // Negative = HTTPClient never got a response (connect/TLS/send failed).
+    if (code >= 0) {
+        s_postFailStreak = 0;
+    } else if (++s_postFailStreak >= POST_FAILS_BEFORE_PPP_RESET) {
+        s_postFailStreak = 0;
+        restartStalePpp();
+    }
+#endif
     return code;
 }
 #endif
@@ -617,40 +645,74 @@ static void replaySpooledBatches() {
 }
 
 // ---- Batch drain + POST ---------------------------------------------------
-static void drainAndPublish() {
+// Builds and POSTs one batch of at most maxFrames frames, also capped by
+// BATCH_MAX_FRAMES and by BATCH_MAX_JSON_BYTES of serialized JSON: with
+// 64-byte CAN FD frames a frame-count cap alone would overshoot it ~2x.
+// Returns the number of frames taken off the queue, or -1 if the batch was
+// not stored (spooled, or dropped on a non-retryable HTTP status).
+static int publishOneBatch(int maxFrames) {
+    // Batch header (device_id, seq, dropped_frames, brackets).
+    static const size_t kBudget = BATCH_MAX_JSON_BYTES - strlen(TELEMETRY_DEVICE_ID) - 96;
+
     TelemetryBatch batch;
-    batch.seq = s_batchSeq++;
     batch.dropped_frames = canHandlerTakeDroppedCount();
 
+    size_t bytes = 0;
     CanFrame f;
-    while ((int)batch.frames.size() < BATCH_MAX_FRAMES &&
-           xQueueReceive(g_canQueue, &f, 0) == pdTRUE) {
+    while ((int)batch.frames.size() < std::min(maxFrames, BATCH_MAX_FRAMES) &&
+           xQueuePeek(g_canQueue, &f, 0) == pdTRUE) {
+        size_t frameBytes = telemetryFrameJsonMaxBytes(f);
+        if (!batch.frames.empty() && bytes + frameBytes > kBudget) break;
+        xQueueReceive(g_canQueue, &f, 0); // sole consumer: this is the frame just peeked
         batch.frames.push_back(f);
+        bytes += frameBytes;
     }
 
     if (batch.frames.empty() && batch.dropped_frames == 0) {
-        return; // nothing to report this window
+        return 0; // nothing to report this window
     }
+    batch.seq = s_batchSeq++;
 
     String json = telemetryFormatBatch(batch, TELEMETRY_DEVICE_ID, timeSyncEpochMsFor);
     int code = httpPostJson(json.c_str(), json.length());
 
     if (ingestStored(code)) {
-        Serial.printf("[net] posted batch seq=%lu frames=%u dropped=%u (HTTP %d)\n",
+        Serial.printf("[net] posted batch seq=%lu frames=%u bytes=%u dropped=%u (HTTP %d)\n",
                       (unsigned long)batch.seq, (unsigned)batch.frames.size(),
-                      (unsigned)batch.dropped_frames, code);
-    } else if (ingestAlreadyStored(code)) {
+                      (unsigned)json.length(), (unsigned)batch.dropped_frames, code);
+        return (int)batch.frames.size();
+    }
+    if (ingestAlreadyStored(code)) {
         Serial.printf("[net] batch seq=%lu already stored (HTTP 409), not spooling\n",
                       (unsigned long)batch.seq);
-    } else if (!ingestRetryable(code)) {
+        return (int)batch.frames.size();
+    }
+    if (!ingestRetryable(code)) {
         Serial.printf("[net] POST rejected (HTTP %d), dropping seq=%lu -- "
                       "check HTTPS_INGEST_URL, HTTPS_API_KEY, and the table schema\n",
                       code, (unsigned long)batch.seq);
-    } else {
-        Serial.printf("[net] POST failed (HTTP %d), spooling seq=%lu\n",
-                      code, (unsigned long)batch.seq);
-        spoolBatch(json);
+        return -1;
     }
+    Serial.printf("[net] POST failed (HTTP %d), spooling seq=%lu\n",
+                  code, (unsigned long)batch.seq);
+    spoolBatch(json);
+    return -1;
+}
+
+// Publishes everything that was queued when the window opened, in as many
+// batches as it takes. One capped batch per window bounded sustained
+// throughput at BATCH_MAX_FRAMES / BATCH_WINDOW_MS (4 frames/s at the
+// defaults) however fast the uplink was, silently overflowing the queue
+// above that. Frames arriving mid-drain wait for the next window, so a bus
+// faster than the uplink can't pin the net task here; and the first failed
+// publish stops the drain, so an outage still spools one batch per window.
+static void drainAndPublish() {
+    int pending = (int)uxQueueMessagesWaiting(g_canQueue);
+    do {
+        int taken = publishOneBatch(pending);
+        if (taken <= 0) break;
+        pending -= taken;
+    } while (pending > 0);
 }
 
 // ---- Task ------------------------------------------------------------

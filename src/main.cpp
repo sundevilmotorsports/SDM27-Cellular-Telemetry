@@ -8,6 +8,7 @@
 
 #include <Arduino.h>
 #include "can_handler.h"
+#include "can_pins.h"
 #include "net_task.h"
 #include "telemetry_config.h"
 
@@ -15,7 +16,9 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("=== ESP32 CAN-to-Cellular Telemetry PoC ===");
-    Serial.printf("Mode: %s CAN\n", TELEMETRY_USE_SIMULATED_CAN ? "simulated" : "real (TWAI)");
+    Serial.printf("Mode: %s CAN\n", TELEMETRY_USE_SIMULATED_CAN ? "simulated"
+                                     : CAN_USE_MCP2518FD       ? "real (MCP2518FD, classic + FD)"
+                                                               : "real (TWAI, classic only)");
     Serial.printf("Device ID: %s\n", TELEMETRY_DEVICE_ID);
 
     canHandlerStart();

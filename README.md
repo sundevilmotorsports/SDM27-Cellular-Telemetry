@@ -1,7 +1,7 @@
 # ESP32 CAN-to-Cellular Telemetry PoC
 
 Proof-of-concept firmware proving a hardware-to-backend data path: real (or
-simulated) vehicle CAN frames -> ESP32-S3 -> LTE (SIM7670G) -> MQTT broker,
+simulated) vehicle CAN / CAN FD frames -> ESP32-S3 -> LTE (SIM7670G) -> MQTT broker,
 with per-frame microsecond-accurate timestamps preserved end-to-end.
 
 This is a PoC, not a production telemetry stack. It favors clarity and
@@ -16,9 +16,17 @@ correctness over completeness -- see [Known Limitations](#known-limitations).
   connector, this board doesn't), every pin in this README is wrong for it.
   - ESP32-S3-WROOM-1, 16MB flash, **8MB Octal PSRAM**
   - Modem: SIM7670G LTE Cat-1, on UART1 (not USB), 115200 baud
-- **CAN transceiver:** TI SN65HVD232D, single 3.3V supply, wired directly to
-  the ESP32-S3's built-in TWAI controller (no onboard transceiver on this
-  board -- external wiring required, see below).
+- **CAN controller + transceiver (default, `CAN_USE_MCP2518FD=1`):** Soldered
+  "CAN Transceiver MCP2518 board" -- Microchip MCP2518FD SPI CAN FD
+  controller + ATA6561 transceiver, 40 MHz crystal. Receives both classic CAN
+  and CAN FD. External wiring required, see below.
+- **Alternative, classic CAN only (`CAN_USE_MCP2518FD=0`):** TI SN65HVD232D
+  (or Adafruit CAN Pal) wired to the ESP32-S3's built-in TWAI controller.
+  TWAI is not FD-tolerant -- it error-frames any CAN FD frame -- so never put
+  it on a bus carrying CAN FD.
+- **Bench test rig:** an ESP32-C5 + Adafruit CAN Pal generating random
+  classic/FD frames, plus an end-to-end MQTT verifier -- see
+  [bench/README.md](bench/README.md).
 
 ### Pin reference
 
@@ -39,8 +47,13 @@ board (`examples/SimHatCanBusRecv`).
 | Board LED | 12 | active LOW |
 | Battery ADC | 4 | |
 | Solar ADC | 5 | |
-| **CAN TX (TWAI)** | **1** | -> SN65HVD232D pin 1 (D) |
-| **CAN RX (TWAI)** | **2** | <- SN65HVD232D pin 4 (R) |
+| **MCP2518 SCK** | **16** | -> board SCK |
+| **MCP2518 SDI (MOSI)** | **15** | -> board SDI |
+| **MCP2518 SDO (MISO)** | **7** | <- board SDO |
+| **MCP2518 NCS** | **1** | -> board NCS |
+| **MCP2518 INT** | **2** | <- board INT (active low) |
+| CAN TX (TWAI mode only) | 1 | -> SN65HVD232D pin 1 (D) |
+| CAN RX (TWAI mode only) | 2 | <- SN65HVD232D pin 4 (R) |
 | USB D-/D+ | 19/20 | native USB, used for programming |
 
 **Reserved, do not repurpose:** GPIO 0/3/45/46 (strapping), 19/20 (USB),
@@ -48,7 +61,42 @@ board (`examples/SimHatCanBusRecv`).
 PSRAM, which needs these on top of the flash pins other ESP32-S3 boards get
 away without).
 
-### CAN transceiver wiring (SN65HVD232D)
+### CAN wiring: MCP2518 board (default)
+
+The board needs **5V on VCC**: it feeds the ATA6561 transceiver (4.5-5.5V)
+and an onboard LDO that makes 3.3V for the MCP2518FD, whose SPI/INT pins
+are therefore 3.3V logic -- no level shifting. This board's header has no
+"5V" pin: use **VIN**, which is VBUS (USB-C's 5V, live only with USB-C
+plugged in). On 3V3, SPI still works off the LDO but the ATA6561 stays off
+the bus, so the node silently receives nothing. The MCP board's two VCC pins
+are tied together: wire one, and never 3V3 to the other. The SPI pins are the ones
+LilyGo routes to its SimShield header; GPIO1/2 are free because TWAI isn't
+used in this mode. INT wakes the CAN task as frames arrive (with a 10 ms
+polling fallback).
+
+```
+ ESP32-S3 (T-SIM7670G-S3)          Soldered MCP2518 board           CAN bus
+ ┌───────────────────┐         ┌──────────────────────┐
+ │   GPIO16 ──────────┼────────►│ SCK                  │
+ │   GPIO15 ──────────┼────────►│ SDI                  │
+ │   GPIO7  ◄─────────┼─────────┤ SDO        CANH ─────┼──────────► CAN-H
+ │   GPIO1  ──────────┼────────►│ NCS        CANL ─────┼──────────► CAN-L
+ │   GPIO2  ◄─────────┼─────────┤ INT                  │
+ │   VIN    ──────────┼────────►│ VCC (5V)             │
+ │   GND    ──────────┼────────►│ GND                  │
+ └───────────────────┘         │ INT0/INT1/CLKO: NC   │
+                                └──────────────────────┘
+```
+
+- **Termination:** the board's 120Ω terminator is enabled by solder-bridging
+  **JP1** (open from the factory). Bridge it only when this node sits at a
+  physical end of the bus (e.g. on a bench) -- a vehicle bus is already
+  terminated at both ends.
+- Bitrates are in `include/can_pins.h`: `CAN_BITRATE_KBPS` (arbitration /
+  classic, default 500) and `CAN_FD_DATA_BITRATE_KBPS` (FD data phase,
+  default 2000). Both must match the other nodes.
+
+### CAN transceiver wiring (SN65HVD232D, TWAI mode)
 
 The SN65HVD232D is a single-3.3V-supply device (VCC = 3.0-3.6V) with logic
 levels that match the ESP32-S3's GPIO directly -- **no level shifting
@@ -80,6 +128,28 @@ pins 5 and 8 are simply not connected.
 - **This module has no onboard CAN transceiver** -- the wiring above is
   external, on a breadboard/protoboard, not part of the LilyGo PCB.
 
+## Bench wiring reference (all pins)
+
+| From | Pin | To | Pin |
+|---|---|---|---|
+| T-SIM7670G-S3 | GPIO16 | MCP2518 board | SCK |
+| T-SIM7670G-S3 | GPIO15 | MCP2518 board | SDI |
+| T-SIM7670G-S3 | GPIO7 | MCP2518 board | SDO |
+| T-SIM7670G-S3 | GPIO1 | MCP2518 board | NCS |
+| T-SIM7670G-S3 | GPIO2 | MCP2518 board | INT |
+| T-SIM7670G-S3 | VIN (= USB VBUS 5V) | MCP2518 board | one VCC pin only (never 3V3) |
+| T-SIM7670G-S3 | GND | MCP2518 board | GND |
+| ESP32-C5-DevKitC-1 | GPIO4 | CAN Pal | TX |
+| ESP32-C5-DevKitC-1 | GPIO15 | CAN Pal | RX |
+| ESP32-C5-DevKitC-1 | 3V3 | CAN Pal | Vcc |
+| ESP32-C5-DevKitC-1 | GND | CAN Pal | GND and SLNT |
+| CAN Pal | H / L / GND | MCP2518 board | CANH / CANL / GND |
+
+Termination: MCP2518 JP1 solder-bridged and CAN Pal switch ON, giving ~60 Ω
+across CANH/CANL. Bus: 500 kbit/s nominal, 2 Mbit/s FD data. USB ports on
+the Mac: S3 = `/dev/cu.usbmodem101`, C5 = `/dev/cu.usbmodem1101` (native
+USB on both). Test procedure, results and open issues: [bench/README.md](bench/README.md).
+
 ## Architecture
 
 Two FreeRTOS tasks + one shared queue, exactly matching the CAN task's output
@@ -90,7 +160,7 @@ regardless of simulated or real CAN source:
 │  CAN task (core 0)  │        │  Shared queue     │        │  Net task (core 1)  │
 │  can_handler.cpp     │──push─►│  CanFrame[512]    │──pull─►│  net_task.cpp       │
 │                      │        │  (drop-oldest      │        │                      │
-│  - real: TWAI driver │        │   on overflow)      │        │  - modem power-on    │
+│  - real: MCP2518FD   │        │   on overflow)      │        │  - modem power-on    │
 │  - sim: synthetic    │        │                      │        │  - LTE + MQTT connect│
 │    generator          │        └──────────────────┘        │  - batch + serialize │
 │  - capture_us at the  │                                     │  - publish, backoff  │
@@ -101,9 +171,12 @@ regardless of simulated or real CAN source:
 
 - **CAN task** captures `esp_timer_get_time()` (monotonic, microsecond) the
   instant a frame leaves its source, before it touches the queue -- so
-  queueing or network jitter never pollutes inter-frame timing. If the queue
-  is full, it drops the *oldest* queued frame and increments a counter; it
-  never blocks.
+  queueing or network jitter never pollutes inter-frame timing. With the
+  MCP2518FD, that instant is the controller's own 1 µs end-of-frame
+  timestamp, mapped onto `esp_timer` -- so time a frame spends waiting in the
+  controller's FIFO for the SPI read doesn't shift it. If the queue is full,
+  it drops the *oldest* queued frame and increments a counter; it never
+  blocks.
 - **Time sync** (`time_sync.cpp`) is separate from frame capture entirely: it
   tracks an offset between the monotonic clock and true epoch time, synced
   from SNTP (over PPP or WiFi) at boot and every 5 minutes. Each
@@ -126,10 +199,16 @@ JSON, documented in `telemetry_format.h`. One published message per batch:
   "seq": 42,
   "dropped_frames": 0,
   "frames": [
-    { "can_id": 256, "extd": false, "dlc": 8, "data": "0102030405060708", "ts_ms": 1735500000123 }
+    { "can_id": 256, "extd": false, "dlc": 8, "data": "0102030405060708", "ts_ms": 1735500000123 },
+    { "can_id": 291, "extd": false, "dlc": 12, "data": "0102030405060708090a0b0c", "ts_ms": 1735500000125, "fd": true, "brs": true }
   ]
 }
 ```
+
+`dlc` is the payload length in **bytes** (0-8 classic, up to 64 for CAN
+FD), not the 4-bit DLC code from the wire. CAN FD frames add `"fd": true`
+and `"brs"` (bit rate switch); classic frames omit both, so they cost no
+extra uplink bytes.
 
 `ts_ms` is Unix epoch milliseconds, per-frame, at full resolution -- batching
 never averages or collapses timestamps. `dropped_frames` reports the number
@@ -153,7 +232,7 @@ Edit `include/telemetry_config.h`:
 
 | Setting | What it controls |
 |---|---|
-| `TELEMETRY_USE_SIMULATED_CAN` | `1` = synthetic frames (no CAN hardware needed), `0` = real TWAI driver |
+| `TELEMETRY_USE_SIMULATED_CAN` | `1` = synthetic frames (no CAN hardware needed), `0` = real CAN (MCP2518FD or TWAI, per `CAN_USE_MCP2518FD` in `include/can_pins.h`) |
 | `TELEMETRY_USE_WIFI` | `1` = transmit over the ESP32-S3's onboard WiFi radio instead of the cellular modem (bench testing without a SIM); `0` = cellular (default, real deployment path) |
 | `WIFI_AP_MODE` | Only used when `TELEMETRY_USE_WIFI=1`. `1` = the ESP32-S3 hosts its own network (`WIFI_AP_SSID`/`_PASSWORD`) for your laptop/phone to join directly -- no existing WiFi needed, but no internet uplink either, so batches are spooled and not POSTed, and NTP time sync is skipped. `0` = join an existing network instead (the settings below). |
 | `WIFI_SSID`, `WIFI_ENTERPRISE`, `WIFI_PASSWORD` / `WIFI_EAP_*` | Only used when `TELEMETRY_USE_WIFI=1` and `WIFI_AP_MODE=0`. Set `WIFI_ENTERPRISE=1` for WPA2/WPA3-Enterprise networks (802.1X, e.g. eduroam or a corporate network) that ask for a username **and** password to join directly -- PEAP/MSCHAPv2 only, not EAP-TLS. Leave it `0` for an ordinary single-password network. |
@@ -161,15 +240,17 @@ Edit `include/telemetry_config.h`:
 | `HTTPS_INGEST_URL` | Full POST URL. For Supabase: `https://<project-ref>.supabase.co/rest/v1/<table>`. Put it in `.env`, not in the header. |
 | `HTTPS_API_KEY` | Sent as the `apikey` header. For Supabase this is `SUPABASE_PUBLISHABLE_KEY` (`sb_publishable_...`), or the legacy anon JWT. Never the secret / `service_role` key. Put it in `.env`. |
 | `TELEMETRY_DEVICE_ID` | Identifies this device in every batch |
-| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES` | Batching/backpressure tuning |
+| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES`, `BATCH_MAX_JSON_BYTES` | Batching/backpressure tuning. Every `BATCH_WINDOW_MS` the net task POSTs as many batches as it takes to empty the queue, each capped by `BATCH_MAX_FRAMES` and by `BATCH_MAX_JSON_BYTES` of JSON |
 | `TELEMETRY_STRESS_TEST` | Leave `0`. The old MQTT filler burst is not POSTed to the ingest URL. |
 | `MODEM_USB_BENCH_MODE` | `1` = power the modem on and stop -- no registration/MQTT/stress test, UART1 stays silent so a PC can drive the modem directly over its own USB port (see [USB direct-to-modem bench](#usb-direct-to-modem-bench-bypassing-the-esp32-modem-uart)); `0` = normal operation (default). Cellular only. |
 | `SMS_TEST_ENABLED` | `1` = send one test SMS after the modem registers on the network, to `SMS_TEST_NUMBER` (see `include/sms_config.h`); `0` = off (default). Cellular only -- build error under `TELEMETRY_USE_WIFI=1` |
 
-CAN bitrate is in `include/can_pins.h` (`CAN_BITRATE_KBPS`, default 500
-kbit/s) -- **must match the vehicle bus you're connecting to**; body/comfort
-buses on some vehicles run at 125 kbit/s or slower, while OBD-II diagnostic
-CAN is standard at 500 kbit/s.
+CAN hardware and bitrates are in `include/can_pins.h`: `CAN_USE_MCP2518FD`
+(default `1`), `CAN_BITRATE_KBPS` (default 500 kbit/s) and
+`CAN_FD_DATA_BITRATE_KBPS` (default 2000 kbit/s, MCP2518FD only) -- **must
+match the bus you're connecting to**; body/comfort buses on some vehicles
+run at 125 kbit/s or slower, while OBD-II diagnostic CAN is standard at
+500 kbit/s.
 
 ## Building
 
@@ -217,8 +298,9 @@ involved.
 
 1. Set `TELEMETRY_USE_SIMULATED_CAN` to `0`, set `MQTT_BROKER_HOST` to your
    own broker (not the public HiveMQ default), and set your APN.
-2. Wire the SN65HVD232D per the diagram above; connect CANH/CANL to the
-   vehicle bus (e.g. OBD-II pins 6 and 14).
+2. Wire the MCP2518 board (or, in TWAI mode, the SN65HVD232D) per the
+   diagrams above; connect CANH/CANL to the vehicle bus (e.g. OBD-II pins 6
+   and 14).
 3. Subscribe to `MQTT_TOPIC_TELEMETRY` on your broker (e.g.
    `mosquitto_sub -h <host> -t esp32_cellular_telemetry/batch -v`) before
    powering the board, so you catch the first batches.
@@ -335,6 +417,85 @@ and replug without touching the button before assuming something's wrong.
 **This also spends real billed data on a metered SIM, same as the firmware
 stress test** -- there is no dry-run mode here either.
 
+## Throughput and bottlenecks
+
+Measured on the bench, 2026-10-22: MCP2518FD at 500 kbit/s arbitration /
+2 Mbit/s FD data, LTE uplink, MQTT over TLS. Details are in
+[bench/README.md](bench/README.md#bench-results-2026-10-22).
+
+| Stage | Frames/s | Throughput | Limit |
+|---|---|---|---|
+| CAN bus into the S3 | ~4,700 max (2,000 sustained, 0 errors) | ~525 kbit/s of CAN payload | Bus bit rates (bus saturated) |
+| S3 to modem to broker | **605** | 553 kbit/s of JSON = **68 kbit/s of CAN payload** | ESP32-to-modem UART (921,600 baud = 737 kbit/s raw) |
+
+The uplink pipe is full, but mostly with JSON overhead: a frame with ~14
+bytes of data costs ~115 bytes of JSON (hex doubles every byte, and field
+names and a 13-digit timestamp repeat per frame). Carrying the bus's full
+525 kbit/s of payload as JSON would need ~4.2 Mbit/s of uplink, about 6x
+the UART. The bottlenecks, in order:
+
+1. **JSON encoding (~8x the raw payload).** This is the biggest lever. A
+   compact layout (one batch base timestamp plus per-frame ms deltas,
+   positional arrays, base64 data) measures ~2.5-3x; see
+   [the proposal below](#proposed-compact-timestamp-delta-json-not-implemented-yet). A binary format
+   (CBOR/protobuf) is ~1.5-2x.
+2. **ESP32-to-modem UART, 737 kbit/s raw.** PPP/TCP/TLS framing leaves ~75%
+   for payload. Raising `MODEM_TARGET_BAUDRATE` lifts it, but the board has
+   no RTS/CTS, so byte loss at higher rates needs testing.
+3. **Default batching caps delivery at ~34 frames/s** (`CAN_QUEUE_DEPTH`
+   512 per `BATCH_WINDOW_MS` 15 s), deliberately, to bound cellular data
+   cost. Both are `.env`-overridable. The 605 frames/s figure used 4096 /
+   1000 ms.
+4. **Offline spooling** stalls the CPUs during each LittleFS write, which
+   drops a few frames at ~2,000 frames/s (the MCP2518's 26-frame FIFO lasts
+   13 ms). There's no flash writing while online.
+
+Not bottlenecks: the CAN bus at realistic loads (real vehicles typically
+run at 20-50% bus load), the LTE link itself (the SIM7670G is Cat-1,
+~5 Mbit/s up), and the MQTT broker (HiveMQ took 553 kbit/s with zero bad
+frames). Switching MQTT to HTTPS doesn't remove any of the above, and
+per-request headers and round trips add cost unless the TLS connection is
+reused across POSTs.
+
+## Proposed: compact timestamp-delta JSON (not implemented yet)
+
+The biggest uplink lever is the per-frame JSON (see above). Sending the
+timestamp once per batch (`t0`) and a small per-frame ms offset, with frames
+as positional arrays, keeps the payload JSON (so MQTT, HTTPS/Supabase and
+`jsonb` all still work) while cutting its size ~2.5-3x:
+
+```json
+{"device_id":"esp32-sim7670g-poc-01","seq":42,"dropped_frames":0,"t0":1761184500123,
+ "f":[[291,6,"a1b2c3d4e5f6a7b8c9d0e1f2",0],[1793,0,"0102030405060708",2]]}
+```
+
+Each frame is `[can_id, flags, data, ms after t0]`, where `flags` is a
+bitmask: 1 = extended ID, 2 = CAN FD, 4 = bit rate switch. Measured on
+60-frame batches:
+
+| Layout | Bench mix (~14 B payload) | Classic car frames (8 B) |
+|---|---|---|
+| Current format | 117 B/frame (7.5x payload) | 85 B/frame (10.6x) |
+| `t0` + offset, short keys | 63 B (4.0x) | 41 B (5.1x) |
+| `t0` + offset, arrays (above) | 48 B (3.1x) | 31 B (3.9x) |
+| Arrays + base64 `data` | 39 B (2.5x) | 27 B (3.4x) |
+
+On the same uplink that's roughly 2.4-3x more frames/s: ~1,450-1,800 frames/s
+instead of the measured 605.
+
+Trade-offs and work needed:
+- Harder to read by eye. `web/dashboard.html`, `bench/verify_frames.py`
+  and the Supabase table on the HTTPS branch all have to understand it. Plan
+  to put it behind a config switch, so the current format keeps working
+  until they're updated.
+- If Supabase stores one row per frame, the server (or a trigger in the
+  database) has to expand each batch. One row per batch with the frames as
+  `jsonb` works directly.
+- Millisecond offsets drop the microsecond capture precision. Microsecond
+  offsets cost about 3 more characters per frame.
+- Beyond this, a binary format (CBOR/protobuf, ~1.5-2x payload) is the next
+  step, at the cost of JSON's readability and direct `jsonb` storage.
+
 ## Known limitations
 
 - **Timestamp accuracy** is bounded by SNTP over the cellular link --
@@ -350,14 +511,15 @@ stress test** -- there is no dry-run mode here either.
   `SPOOL_MAX_FILES` (oldest dropped beyond that). This is not a durable,
   unbounded store-and-forward system -- a very long outage will still lose
   the oldest spooled data.
-- **JSON bandwidth overhead.** At full detail, JSON costs roughly 2-3x the
-  bytes of a packed binary format per frame. Fine for a PoC on a Cat-1 link
-  at moderate frame rates; a production version should switch to CBOR or
-  protobuf.
+- **JSON bandwidth overhead.** The current per-frame JSON measures ~7.5-10x
+  the raw CAN payload (~115 bytes for a ~14-byte frame), which makes it the
+  main uplink bottleneck (see [Throughput and bottlenecks](#throughput-and-bottlenecks)).
+  A compact JSON layout or a binary format (CBOR/protobuf) cuts that 3-5x.
 - **No production security hardening, OTA, or fleet management.** MQTT
   credentials are broker auth only (no TLS configured by default, no
   device-cert-based mTLS); this is explicitly out of scope for the PoC.
-- **CAN filter accepts everything** (`TWAI_FILTER_CONFIG_ACCEPT_ALL()`).
+- **CAN filter accepts everything** (MCP2518FD filter 0 with an all-zero
+  mask, or `TWAI_FILTER_CONFIG_ACCEPT_ALL()` in TWAI mode).
   Fine for a PoC observing all bus traffic; a production node would filter
   to the IDs it actually needs.
 - **Uplink is capped by the ESP32<->modem UART**, not the SIM7670G's Cat-1

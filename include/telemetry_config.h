@@ -199,9 +199,21 @@
 // A wider window amortizes the per-POST overhead (HTTP headers + a TLS
 // handshake, if the server does not keep the socket) over more frames, but it
 // NOT reduce the per-frame cost, so it can't rescue a high generator rate.
-#define CAN_QUEUE_DEPTH 512   // frames; oldest dropped when full
-#define BATCH_WINDOW_MS 15000 // how often the net task drains the queue
+// The queue and window are overridable from .env for throughput testing:
+// end-to-end delivery can't exceed CAN_QUEUE_DEPTH frames per BATCH_WINDOW_MS
+// (~34 frames/s at the defaults) however fast the CAN bus or uplink is.
+#ifndef CAN_QUEUE_DEPTH
+#define CAN_QUEUE_DEPTH 512   // frames; oldest dropped when full (~40 KB, in PSRAM)
+#endif
+#ifndef BATCH_WINDOW_MS
+#define BATCH_WINDOW_MS 15000 // how often the net task drains the queue (publishing
+                              // as many batches as it takes to empty it)
+#endif
 #define BATCH_MAX_FRAMES 60   // hard cap on frames per published batch
+// Upper bound on one batch's JSON: the net task stops adding frames before a
+// batch would exceed this (~110 bytes per classic frame, up to ~240 per
+// 64-byte CAN FD frame), so a frame-count cap alone can't overshoot it ~2x.
+#define BATCH_MAX_JSON_BYTES 8192
 
 // ---- Wall-clock (epoch) sync -----------------------------------------
 #define TIME_SYNC_INTERVAL_MS (5UL * 60UL * 1000UL) // resync every 5 minutes
