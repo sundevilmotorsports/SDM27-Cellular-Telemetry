@@ -222,7 +222,7 @@ meaningfully cut per-frame overhead on a Cat-1 link -- see below.
 ## Configuration
 
 Non-sensitive settings (transport mode, batching, CAN sim rates) go directly
-in `include/telemetry_config.h`. Credentials (WiFi/APN/MQTT) don't -- copy
+in `include/telemetry_config.h`. Credentials (WiFi/APN/HTTPS ingest) don't -- copy
 `.env.example` to `.env` (git-ignored) and put real values there instead;
 `load_env.py` injects `.env` at build time as compiler defines, which
 override the placeholders in `telemetry_config.h`. No `.env` -> the
@@ -234,15 +234,14 @@ Edit `include/telemetry_config.h`:
 |---|---|
 | `TELEMETRY_USE_SIMULATED_CAN` | `1` = synthetic frames (no CAN hardware needed), `0` = real CAN (MCP2518FD or TWAI, per `CAN_USE_MCP2518FD` in `include/can_pins.h`) |
 | `TELEMETRY_USE_WIFI` | `1` = transmit over the ESP32-S3's onboard WiFi radio instead of the cellular modem (bench testing without a SIM); `0` = cellular (default, real deployment path) |
-| `WIFI_AP_MODE` | Only used when `TELEMETRY_USE_WIFI=1`. `1` = the ESP32-S3 hosts its own network (`WIFI_AP_SSID`/`_PASSWORD`) for your laptop/phone to join directly -- no existing WiFi needed, but no internet uplink either, so point `MQTT_BROKER_HOST` at a broker running on whatever device joins this AP, and note NTP time sync is skipped in this mode. `0` = join an existing network instead (the settings below). |
+| `WIFI_AP_MODE` | Only used when `TELEMETRY_USE_WIFI=1`. `1` = the ESP32-S3 hosts its own network (`WIFI_AP_SSID`/`_PASSWORD`) for your laptop/phone to join directly -- no existing WiFi needed, but no internet uplink either, so batches are spooled and not POSTed, and NTP time sync is skipped. `0` = join an existing network instead (the settings below). |
 | `WIFI_SSID`, `WIFI_ENTERPRISE`, `WIFI_PASSWORD` / `WIFI_EAP_*` | Only used when `TELEMETRY_USE_WIFI=1` and `WIFI_AP_MODE=0`. Set `WIFI_ENTERPRISE=1` for WPA2/WPA3-Enterprise networks (802.1X, e.g. eduroam or a corporate network) that ask for a username **and** password to join directly -- PEAP/MSCHAPv2 only, not EAP-TLS. Leave it `0` for an ordinary single-password network. |
 | `TELEMETRY_APN` / `_USER` / `_PASS` | Your carrier's APN credentials (cellular mode only) |
-| `MQTT_BROKER_HOST` / `_PORT` | Your broker. Ships pointed at the public HiveMQ broker for an initial connectivity smoke test only -- **do not** use it for real vehicle data |
-| `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker auth, if required |
-| `MQTT_TOPIC_TELEMETRY` | Publish topic |
+| `HTTPS_INGEST_URL` | Full POST URL. For Supabase: `https://<project-ref>.supabase.co/rest/v1/<table>`. Put it in `.env`, not in the header. |
+| `HTTPS_API_KEY` | Sent as the `apikey` header. For Supabase this is `SUPABASE_PUBLISHABLE_KEY` (`sb_publishable_...`), or the legacy anon JWT. Never the secret / `service_role` key. Put it in `.env`. |
 | `TELEMETRY_DEVICE_ID` | Identifies this device in every batch |
-| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES` | Batching/backpressure tuning. Every `BATCH_WINDOW_MS` the net task publishes as many batches as it takes to empty the queue, each capped by `BATCH_MAX_FRAMES` and by `MQTT_BUFFER_SIZE` bytes of JSON |
-| `TELEMETRY_STRESS_TEST` | `1` = run a one-time, time-bounded uplink throughput burst after MQTT connects (see [Uplink stress test](#uplink-stress-test)); `0` = normal operation (default) |
+| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES`, `BATCH_MAX_JSON_BYTES` | Batching/backpressure tuning. Every `BATCH_WINDOW_MS` the net task POSTs as many batches as it takes to empty the queue, each capped by `BATCH_MAX_FRAMES` and by `BATCH_MAX_JSON_BYTES` of JSON |
+| `TELEMETRY_STRESS_TEST` | Leave `0`. The old MQTT filler burst is not POSTed to the ingest URL. |
 | `MODEM_USB_BENCH_MODE` | `1` = power the modem on and stop -- no registration/MQTT/stress test, UART1 stays silent so a PC can drive the modem directly over its own USB port (see [USB direct-to-modem bench](#usb-direct-to-modem-bench-bypassing-the-esp32-modem-uart)); `0` = normal operation (default). Cellular only. |
 | `SMS_TEST_ENABLED` | `1` = send one test SMS after the modem registers on the network, to `SMS_TEST_NUMBER` (see `include/sms_config.h`); `0` = off (default). Cellular only -- build error under `TELEMETRY_USE_WIFI=1` |
 

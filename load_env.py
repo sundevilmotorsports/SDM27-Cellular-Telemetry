@@ -1,4 +1,4 @@
-# Reads .env (git-ignored, holds real WiFi/cellular/MQTT credentials) and
+# Reads .env (git-ignored, holds real WiFi/cellular/HTTPS credentials) and
 # injects each entry as a compiler #define, so telemetry_config.h's
 # #ifndef-guarded placeholders get overridden at build time without any
 # secret ever being written into a tracked file. Values that don't already

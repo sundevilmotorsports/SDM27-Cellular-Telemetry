@@ -41,7 +41,7 @@ struct CanFrame {
 };
 
 // Upper bound on one frame's serialized JSON, used to keep each batch under
-// MQTT_BUFFER_SIZE. Worst case is a 29-bit ID, 64-byte FD frame with a
+// BATCH_MAX_JSON_BYTES. Worst case is a 29-bit ID, 64-byte FD frame with a
 // 13-digit ts_ms: ~100 bytes of keys/punctuation/numbers + 2 hex chars/byte.
 inline size_t telemetryFrameJsonMaxBytes(const CanFrame &f) {
     return 112 + 2 * (size_t)f.dlc;
