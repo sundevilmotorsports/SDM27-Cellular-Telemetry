@@ -437,7 +437,8 @@ the UART. The bottlenecks, in order:
 
 1. **JSON encoding (~8x the raw payload).** This is the biggest lever. A
    compact layout (one batch base timestamp plus per-frame ms deltas,
-   positional arrays, base64 data) measures ~2.5-3x. A binary format
+   positional arrays, base64 data) measures ~2.5-3x; see
+   [the proposal below](#proposed-compact-timestamp-delta-json-not-implemented-yet). A binary format
    (CBOR/protobuf) is ~1.5-2x.
 2. **ESP32-to-modem UART, 737 kbit/s raw.** PPP/TCP/TLS framing leaves ~75%
    for payload. Raising `MODEM_TARGET_BAUDRATE` lifts it, but the board has
@@ -456,6 +457,45 @@ run at 20-50% bus load), the LTE link itself (the SIM7670G is Cat-1,
 frames). Switching MQTT to HTTPS doesn't remove any of the above, and
 per-request headers and round trips add cost unless the TLS connection is
 reused across POSTs.
+
+## Proposed: compact timestamp-delta JSON (not implemented yet)
+
+The biggest uplink lever is the per-frame JSON (see above). Sending the
+timestamp once per batch (`t0`) and a small per-frame ms offset, with frames
+as positional arrays, keeps the payload JSON (so MQTT, HTTPS/Supabase and
+`jsonb` all still work) while cutting its size ~2.5-3x:
+
+```json
+{"device_id":"esp32-sim7670g-poc-01","seq":42,"dropped_frames":0,"t0":1761184500123,
+ "f":[[291,6,"a1b2c3d4e5f6a7b8c9d0e1f2",0],[1793,0,"0102030405060708",2]]}
+```
+
+Each frame is `[can_id, flags, data, ms after t0]`, where `flags` is a
+bitmask: 1 = extended ID, 2 = CAN FD, 4 = bit rate switch. Measured on
+60-frame batches:
+
+| Layout | Bench mix (~14 B payload) | Classic car frames (8 B) |
+|---|---|---|
+| Current format | 117 B/frame (7.5x payload) | 85 B/frame (10.6x) |
+| `t0` + offset, short keys | 63 B (4.0x) | 41 B (5.1x) |
+| `t0` + offset, arrays (above) | 48 B (3.1x) | 31 B (3.9x) |
+| Arrays + base64 `data` | 39 B (2.5x) | 27 B (3.4x) |
+
+On the same uplink that's roughly 2.4-3x more frames/s: ~1,450-1,800 frames/s
+instead of the measured 605.
+
+Trade-offs and work needed:
+- Harder to read by eye. `web/dashboard.html`, `bench/verify_frames.py`
+  and the Supabase table on the HTTPS branch all have to understand it. Plan
+  to put it behind a config switch, so the current format keeps working
+  until they're updated.
+- If Supabase stores one row per frame, the server (or a trigger in the
+  database) has to expand each batch. One row per batch with the frames as
+  `jsonb` works directly.
+- Millisecond offsets drop the microsecond capture precision. Microsecond
+  offsets cost about 3 more characters per frame.
+- Beyond this, a binary format (CBOR/protobuf, ~1.5-2x payload) is the next
+  step, at the cost of JSON's readability and direct `jsonb` storage.
 
 ## Known limitations
 
