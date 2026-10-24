@@ -1,6 +1,6 @@
-// Owns the modem, the HTTPS POST path, and spool replay.
-// Drains the shared CAN queue into time-windowed batches, serializes them,
-// and POSTs the JSON to HTTPS_INGEST_URL. Never touches CAN capture timing.
+// Owns the modem and the HTP/1 HTTPS POST path.
+// Builds 1-second channel-set-1 windows and POSTs them to the telemetry-ingest
+// edge function. Does not drain the CAN queue; real CAN mapping is not wired.
 
 #pragma once
 

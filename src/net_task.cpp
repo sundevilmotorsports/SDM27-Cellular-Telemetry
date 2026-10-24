@@ -2,14 +2,18 @@
 #include "board_pins.h"
 #include "telemetry_config.h"
 #include "sms_config.h"
-#include "telemetry_format.h"
 #include "time_sync.h"
-#include "can_handler.h"
+#include "htp_frame.h"
 
-#include <HTTPClient.h>
-#include <LittleFS.h>
 #include <Arduino.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <esp_random.h>
+#include <esp_timer.h>
+#include <mbedtls/md.h>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <vector>
 
 #if SMS_TEST_ENABLED && TELEMETRY_USE_WIFI
@@ -38,13 +42,8 @@ static HardwareSerial &SerialAT = Serial1;
 static NetworkClientSecure netClient;
 #endif
 
-static uint32_t s_batchSeq = 0;
 static uint32_t s_lastRegCheckMs = 0;
-static uint32_t s_lastBatchMs = 0;
 static uint32_t s_lastTimeSyncMs = 0;
-static int s_spoolFileCounter = 0;
-static uint32_t s_lastReplayMs = 0;
-static uint32_t s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
 
 #if TELEMETRY_USE_WIFI
 #if WIFI_AP_MODE
@@ -480,41 +479,134 @@ static void restartStalePpp() {
 }
 #endif
 
-// ---- HTTPS POST ---------------------------------------------------------
-// There is no session to maintain. Each batch is one POST; the status line is
-// the ack MQTT QoS 0 never gave. 2xx means stored. 409 means a unique
-// constraint already has this (device_id, seq), which a spool replay will hit
-// if the original POST landed and the response was lost. 400/401/403/404/422
-// will not get better by retrying.
+// ---- HTP/1 POST ------------------------------------------------------------
+// One encoded window per frame. The in-RAM queue is the retry protocol.
+// Old LittleFS JSON batches are not replayed: they are not HTP and would 400.
+
+struct HtpQueuedFrame {
+    uint8_t groupKey;
+    uint32_t seq;
+    uint16_t len;
+    uint8_t body[HTP_MAX_FRAME_BYTES];
+};
+
+static HtpQueuedFrame s_htpQueue[HTP_RETRY_QUEUE_MAX];
+static int s_htpHead = 0;
+static int s_htpCount = 0;
+static uint32_t s_htpSeq[HTP_GROUP_COUNT] = {};
+static uint32_t s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
+static uint32_t s_htpNextSendMs = 0;
+static uint32_t s_htpDroppedOldest = 0;
+static uint32_t s_htpPermanentErrors = 0;
+static int64_t s_htpLastWindowSec = -1;
+static float s_htpRelS = 0.0f;
+static uint8_t s_htpSession[16];
+static bool s_htpSessionOk = false;
+static bool s_htpConfigOk = false;
+
+static bool htpConfigReady() {
+    return HTP_CHANNEL_SET_ID == 1 && strlen(HTTPS_INGEST_URL) > 0 &&
+           strlen(TELEMETRY_HMAC_KEY) > 0 && s_htpSessionOk;
+}
+
+static void htpLogConfigOnce() {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    if (!strlen(HTTPS_INGEST_URL) || !strlen(TELEMETRY_HMAC_KEY) || !strlen(HTP_SESSION_ID)) {
+        Serial.println("[htp] HTTPS_INGEST_URL, TELEMETRY_HMAC_KEY, or HTP_SESSION_ID is empty; "
+                       "no posts until .env is set and the board is reflashed");
+        return;
+    }
+    if (!s_htpSessionOk) {
+        Serial.println("[htp] HTP_SESSION_ID is not a UUID; no posts");
+        return;
+    }
+    if (HTP_CHANNEL_SET_ID != 1) {
+        Serial.println("[htp] HTP_CHANNEL_SET_ID must be 1 until another set is frozen; no posts");
+        return;
+    }
+    if (strstr(HTTPS_INGEST_URL, "/rest/") != nullptr) {
+        Serial.println("[htp] URL looks like PostgREST, not telemetry-ingest; posts will be rejected");
+    }
+    Serial.printf("[htp] ingest %s\n", HTTPS_INGEST_URL);
+    Serial.printf("[htp] device=%s session=%s set=%u\n",
+                  HTP_DEVICE_ID, HTP_SESSION_ID, (unsigned)HTP_CHANNEL_SET_ID);
+}
+
+static int htpQueueIndex(int offset) {
+    return (s_htpHead + offset) % HTP_RETRY_QUEUE_MAX;
+}
+
+static void htpDropOldest() {
+    if (s_htpCount == 0) return;
+    s_htpHead = (s_htpHead + 1) % HTP_RETRY_QUEUE_MAX;
+    s_htpCount--;
+    s_htpDroppedOldest++;
+}
+
+static void htpEnqueue(uint8_t groupKey, uint32_t seq, const uint8_t *body, size_t len) {
+    if (len == 0 || len > HTP_MAX_FRAME_BYTES) return;
+    if (s_htpCount == HTP_RETRY_QUEUE_MAX) htpDropOldest();
+    HtpQueuedFrame &slot = s_htpQueue[htpQueueIndex(s_htpCount)];
+    slot.groupKey = groupKey;
+    slot.seq = seq;
+    slot.len = (uint16_t)len;
+    memcpy(slot.body, body, len);
+    s_htpCount++;
+}
+
+static void htpDequeueHead() {
+    if (s_htpCount == 0) return;
+    s_htpHead = (s_htpHead + 1) % HTP_RETRY_QUEUE_MAX;
+    s_htpCount--;
+}
+
 #if TELEMETRY_USE_WIFI && WIFI_AP_MODE
-static int httpPostJson(const char *json, size_t len) {
-    (void)json;
+static int httpPostHtp(const uint8_t *body, size_t len, String &response) {
+    (void)body;
     (void)len;
-    return 0; // no route to the ingest host from the SoftAP
+    response = "";
+    return 0;
 }
 #else
-static int httpPostJson(const char *json, size_t len) {
-    if (!networkBearerUp() || !strlen(HTTPS_INGEST_URL) || !strlen(HTTPS_API_KEY)) {
-        return 0;
+static void hmacHex(const uint8_t *body, size_t len, char out[65]) {
+    uint8_t mac[32];
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    int rc = mbedtls_md_hmac(info,
+                             reinterpret_cast<const unsigned char *>(TELEMETRY_HMAC_KEY),
+                             strlen(TELEMETRY_HMAC_KEY),
+                             body, len, mac);
+    if (rc != 0) {
+        out[0] = '\0';
+        return;
     }
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = digits[mac[i] >> 4];
+        out[i * 2 + 1] = digits[mac[i] & 0x0f];
+    }
+    out[64] = '\0';
+}
+
+static int httpPostHtp(const uint8_t *body, size_t len, String &response) {
+    response = "";
+    if (!networkBearerUp() || !s_htpConfigOk) return 0;
+    char sig[65];
+    hmacHex(body, len, sig);
+    if (sig[0] == '\0') return 0;
+
     HTTPClient http;
-    if (!http.begin(netClient, HTTPS_INGEST_URL)) {
-        return 0;
-    }
+    if (!http.begin(netClient, HTTPS_INGEST_URL)) return 0;
     http.setConnectTimeout(HTTPS_POST_TIMEOUT_MS);
     http.setTimeout(HTTPS_POST_TIMEOUT_MS);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", HTTPS_API_KEY);
-    // Legacy anon keys are JWTs (eyJ...). Publishable keys (sb_publishable_...)
-    // are not, and Supabase rejects them if they are also sent as a Bearer token.
-    if (strncmp(HTTPS_API_KEY, "eyJ", 3) == 0) {
-        http.addHeader("Authorization", String("Bearer ") + HTTPS_API_KEY);
-    }
-    http.addHeader("Prefer", "return=minimal");
-    int code = http.POST(reinterpret_cast<uint8_t *>(const_cast<char *>(json)), len);
+    http.addHeader("Content-Type", "application/x-htp");
+    http.addHeader("x-htp-device", HTP_DEVICE_ID);
+    http.addHeader("x-htp-signature", sig);
+    int code = http.POST(const_cast<uint8_t *>(body), len);
+    response = http.getString();
     http.end();
 #if !TELEMETRY_USE_WIFI
-    // Negative = HTTPClient never got a response (connect/TLS/send failed).
     if (code >= 0) {
         s_postFailStreak = 0;
     } else if (++s_postFailStreak >= POST_FAILS_BEFORE_PPP_RESET) {
@@ -526,204 +618,161 @@ static int httpPostJson(const char *json, size_t len) {
 }
 #endif
 
-static bool ingestStored(int code) { return code >= 200 && code < 300; }
-static bool ingestAlreadyStored(int code) { return code == 409; }
-static bool ingestRetryable(int code) {
+// 1 = seq is in acked or dup. 0 = parsed, seq absent. -1 = not JSON.
+static int ackListsSeq(const String &body, uint32_t seq) {
+    JsonDocument doc;
+    if (deserializeJson(doc, body) != DeserializationError::Ok) return -1;
+    for (const char *key : {"acked", "dup"}) {
+        JsonArray arr = doc[key].as<JsonArray>();
+        for (JsonVariant v : arr) {
+            if (v.as<uint32_t>() == seq) return 1;
+        }
+    }
+    return 0;
+}
+
+static bool htpRetryable(int code) {
     return code <= 0 || code == 408 || code == 429 || code >= 500;
 }
 
-// ---- Offline spooling (LittleFS) -----------------------------------------
-// Resume numbering above the highest spool file already on disk. LittleFS
-// survives reboots and reflashes, but this counter did not: it restarted at 0
-// every boot, so a new run overwrote the batches a previous run had spooled --
-// silently destroying exactly the data spooling exists to preserve, and
-// leaving a mix of old and new files sharing the same names.
-static void initSpoolCounter() {
-    File dir = LittleFS.open(SPOOL_DIR);
-    if (!dir || !dir.isDirectory()) return;
-
-    int maxIdx = -1;
-    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-        String name(f.name());
-        int slash = name.lastIndexOf('/');
-        if (slash >= 0) {
-            name = name.substring(slash + 1);  // some cores report a full path
-        }
-        int idx = name.toInt();  // "0000000004.json" -> 4
-        if (idx > maxIdx) maxIdx = idx;
-    }
-    s_spoolFileCounter = maxIdx + 1;
-    if (s_spoolFileCounter > 0) {
-        Serial.printf("[net] resuming spool numbering at %d\n", s_spoolFileCounter);
-    }
+static uint32_t htpBackoffDelay() {
+    uint32_t span = s_htpBackoffMs / 5;
+    uint32_t jitter = span == 0 ? 0 : (esp_random() % (2 * span + 1));
+    return s_htpBackoffMs - span + jitter;
 }
 
-static void spoolBatch(const String &json) {
-    // Drop-oldest cap: if the spool directory is full, delete the oldest
-    // file before writing a new one, mirroring the in-memory queue's policy.
-    File dir = LittleFS.open(SPOOL_DIR);
-    if (dir && dir.isDirectory()) {
-        std::vector<String> names;
-        for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-            names.push_back(String(f.name()));
-        }
-        if ((int)names.size() >= SPOOL_MAX_FILES) {
-            std::sort(names.begin(), names.end());
-            LittleFS.remove(String(SPOOL_DIR) + "/" + names.front());
-        }
+static void htpNoteFailure() {
+    uint32_t wait = htpBackoffDelay();
+    s_htpNextSendMs = millis() + wait;
+    if (s_htpBackoffMs < HTP_BACKOFF_MAX_MS) {
+        s_htpBackoffMs = std::min<uint32_t>(s_htpBackoffMs * 2, HTP_BACKOFF_MAX_MS);
     }
+    Serial.printf("[htp] retry in %lu ms\n", (unsigned long)wait);
+}
 
-    char path[64];
-    snprintf(path, sizeof(path), "%s/%010d.json", SPOOL_DIR, s_spoolFileCounter++);
-    File f = LittleFS.open(path, "w");
-    if (!f) {
-        Serial.println("[net] failed to open spool file for write");
+static void htpSendHead() {
+    if (s_htpCount == 0 || !s_htpConfigOk || !networkBearerUp()) return;
+    if ((int32_t)(millis() - s_htpNextSendMs) < 0) return;
+
+    const HtpQueuedFrame &head = s_htpQueue[s_htpHead];
+    String response;
+    int code = httpPostHtp(head.body, head.len, response);
+    if (code == 200) {
+        int listed = ackListsSeq(response, head.seq);
+        if (listed == 1) {
+            Serial.printf("[htp] acked group=%u seq=%lu HTTP 200 (%u bytes)\n",
+                          head.groupKey, (unsigned long)head.seq, (unsigned)head.len);
+            htpDequeueHead();
+            s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
+            s_htpNextSendMs = 0;
+            return;
+        }
+        if (listed < 0) {
+            Serial.println("[htp] HTTP 200 but ack was not JSON; will retry the same frame");
+            htpNoteFailure();
+            return;
+        }
+        s_htpPermanentErrors++;
+        Serial.printf("[htp] HTTP 200 did not ack seq=%lu; dropping frame (permanent=%lu)\n",
+                      (unsigned long)head.seq, (unsigned long)s_htpPermanentErrors);
+        htpDequeueHead();
+        s_htpNextSendMs = 0;
         return;
     }
-    f.print(json);
-    f.close();
-    Serial.printf("[net] spooled batch to %s\n", path);
+    if (htpRetryable(code)) {
+        Serial.printf("[htp] POST failed HTTP %d, resending group=%u seq=%lu\n",
+                      code, head.groupKey, (unsigned long)head.seq);
+        htpNoteFailure();
+        return;
+    }
+    s_htpPermanentErrors++;
+    Serial.printf("[htp] POST rejected HTTP %d, dropping group=%u seq=%lu (permanent=%lu)\n",
+                  code, head.groupKey, (unsigned long)head.seq,
+                  (unsigned long)s_htpPermanentErrors);
+    if (response.length() > 0) {
+        Serial.println(response.substring(0, 160));
+    }
+    htpDequeueHead();
+    s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
+    s_htpNextSendMs = 0;
 }
 
-// Replays a bounded number of spooled batches per call so this never starves
-// live traffic if a large backlog has built up.
-//
-// Rate-limited with backoff. Without it this runs on every pass of the net
-// task's 50ms loop, so a batch that cannot post is retried ~20x/second --
-// each attempt opening TLS and shoving kilobytes at the modem. On a metered
-// SIM that costs real money to accomplish nothing.
-static void replaySpooledBatches() {
-    if (!networkBearerUp()) return;
+static void htpEmitWindows() {
+#if !HTP_SYNTH_MODE
+    return;
+#else
+    if (!g_timeSync.isSynced()) return;
+    int64_t nowMs = g_timeSync.epochMsFor(esp_timer_get_time());
+    int64_t sec = nowMs / 1000;
+    if (sec == s_htpLastWindowSec) return;
+    s_htpLastWindowSec = sec;
+    uint64_t tStartUs = (uint64_t)sec * 1000000ULL;
+    uint64_t sendMs = (uint64_t)nowMs;
 
-    uint32_t now = millis();
-    if (now - s_lastReplayMs < s_replayBackoffMs) return;
-    s_lastReplayMs = now;
-
-    File dir = LittleFS.open(SPOOL_DIR);
-    if (!dir || !dir.isDirectory()) return;
-
-    std::vector<String> names;
-    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-        names.push_back(String(f.name()));
+    float samples[22 * 10];
+    uint8_t frame[HTP_MAX_FRAME_BYTES];
+    for (int g = 0; g < HTP_GROUP_COUNT; g++) {
+        const HtpGroup *group = &kHtpGroups[g];
+        if ((size_t)group->channel_count * group->rate_hz > sizeof(samples) / sizeof(samples[0])) {
+            Serial.printf("[htp] group %u does not fit the sample buffer\n", group->key);
+            continue;
+        }
+        size_t n = 0;
+        for (uint8_t c = 0; c < group->channel_count; c++) {
+            for (uint16_t i = 0; i < group->rate_hz; i++) {
+                float t = s_htpRelS + (float)i / (float)group->rate_hz;
+                samples[n++] = htpSynth(group->channels[c].id, t);
+            }
+        }
+        uint32_t seq = s_htpSeq[g]++;
+        size_t len = htpEncodeFrame(frame, sizeof(frame), s_htpSession, HTP_CHANNEL_SET_ID,
+                                    group, seq, sendMs, 1, &tStartUs, samples);
+        if (len == 0) {
+            Serial.printf("[htp] encode failed group=%u seq=%lu\n", group->key, (unsigned long)seq);
+            continue;
+        }
+        htpEnqueue(group->key, seq, frame, len);
     }
-    std::sort(names.begin(), names.end());
+    s_htpRelS += 1.0f;
+#endif
+}
 
-    const int maxPerCall = 5;
-    int replayed = 0;
-    for (const String &name : names) {
-        if (replayed >= maxPerCall || !networkBearerUp()) break;
-        String path = String(SPOOL_DIR) + "/" + name;
-        File f = LittleFS.open(path, "r");
-        if (!f) continue;
-        String payload = f.readString();
-        f.close();
-
-        int code = httpPostJson(payload.c_str(), payload.length());
-        if (ingestStored(code) || ingestAlreadyStored(code)) {
-            LittleFS.remove(path);
-            replayed++;
-            s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
-        } else if (!ingestRetryable(code)) {
-            // A 401/404/422 will fail the same way on every retry, and the
-            // break below would pin the rest of the spool behind it.
-            Serial.printf("[net] discarding %s: HTTP %d will not succeed on retry\n",
-                          path.c_str(), code);
-            LittleFS.remove(path);
-        } else {
-            s_replayBackoffMs = std::min<uint32_t>(s_replayBackoffMs * 2,
-                                                   SPOOL_REPLAY_MAX_BACKOFF_MS);
-            Serial.printf("[net] spool replay failed for %s (%u bytes, HTTP %d), "
-                          "retry in %lu ms\n",
-                          path.c_str(), (unsigned)payload.length(), code,
-                          (unsigned long)s_replayBackoffMs);
-            break;
+static void htpMaintain() {
+    htpLogConfigOnce();
+    if (!s_htpConfigOk) return;
+#if !(HTP_SYNTH_MODE)
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        Serial.println("[htp] HTP_SYNTH_MODE=0; CAN is not mapped onto channel set 1, so nothing is posted");
+    }
+    return;
+#endif
+    if (!g_timeSync.isSynced()) {
+        static uint32_t last = 0;
+        if (millis() - last > 5000) {
+            last = millis();
+            Serial.println("[htp] waiting for SNTP before the first window");
+        }
+        return;
+    }
+    htpEmitWindows();
+    htpSendHead();
+    if (s_htpDroppedOldest && (s_htpDroppedOldest % 10) == 0) {
+        static uint32_t reported = 0;
+        if (reported != s_htpDroppedOldest) {
+            reported = s_htpDroppedOldest;
+            Serial.printf("[htp] dropped oldest windows: %lu\n", (unsigned long)s_htpDroppedOldest);
         }
     }
-    if (replayed > 0) {
-        Serial.printf("[net] replayed %d spooled batch(es)\n", replayed);
-    }
 }
 
-// ---- Batch drain + POST ---------------------------------------------------
-// Builds and POSTs one batch of at most maxFrames frames, also capped by
-// BATCH_MAX_FRAMES and by BATCH_MAX_JSON_BYTES of serialized JSON: with
-// 64-byte CAN FD frames a frame-count cap alone would overshoot it ~2x.
-// Returns the number of frames taken off the queue, or -1 if the batch was
-// not stored (spooled, or dropped on a non-retryable HTTP status).
-static int publishOneBatch(int maxFrames) {
-    // Batch header (device_id, seq, dropped_frames, brackets).
-    static const size_t kBudget = BATCH_MAX_JSON_BYTES - strlen(TELEMETRY_DEVICE_ID) - 96;
-
-    TelemetryBatch batch;
-    batch.dropped_frames = canHandlerTakeDroppedCount();
-
-    size_t bytes = 0;
-    CanFrame f;
-    while ((int)batch.frames.size() < std::min(maxFrames, BATCH_MAX_FRAMES) &&
-           xQueuePeek(g_canQueue, &f, 0) == pdTRUE) {
-        size_t frameBytes = telemetryFrameJsonMaxBytes(f);
-        if (!batch.frames.empty() && bytes + frameBytes > kBudget) break;
-        xQueueReceive(g_canQueue, &f, 0); // sole consumer: this is the frame just peeked
-        batch.frames.push_back(f);
-        bytes += frameBytes;
-    }
-
-    if (batch.frames.empty() && batch.dropped_frames == 0) {
-        return 0; // nothing to report this window
-    }
-    batch.seq = s_batchSeq++;
-
-    String json = telemetryFormatBatch(batch, TELEMETRY_DEVICE_ID, timeSyncEpochMsFor);
-    int code = httpPostJson(json.c_str(), json.length());
-
-    if (ingestStored(code)) {
-        Serial.printf("[net] posted batch seq=%lu frames=%u bytes=%u dropped=%u (HTTP %d)\n",
-                      (unsigned long)batch.seq, (unsigned)batch.frames.size(),
-                      (unsigned)json.length(), (unsigned)batch.dropped_frames, code);
-        return (int)batch.frames.size();
-    }
-    if (ingestAlreadyStored(code)) {
-        Serial.printf("[net] batch seq=%lu already stored (HTTP 409), not spooling\n",
-                      (unsigned long)batch.seq);
-        return (int)batch.frames.size();
-    }
-    if (!ingestRetryable(code)) {
-        Serial.printf("[net] POST rejected (HTTP %d), dropping seq=%lu -- "
-                      "check HTTPS_INGEST_URL, HTTPS_API_KEY, and the table schema\n",
-                      code, (unsigned long)batch.seq);
-        return -1;
-    }
-    Serial.printf("[net] POST failed (HTTP %d), spooling seq=%lu\n",
-                  code, (unsigned long)batch.seq);
-    spoolBatch(json);
-    return -1;
-}
-
-// Publishes everything that was queued when the window opened, in as many
-// batches as it takes. One capped batch per window bounded sustained
-// throughput at BATCH_MAX_FRAMES / BATCH_WINDOW_MS (4 frames/s at the
-// defaults) however fast the uplink was, silently overflowing the queue
-// above that. Frames arriving mid-drain wait for the next window, so a bus
-// faster than the uplink can't pin the net task here; and the first failed
-// publish stops the drain, so an outage still spools one batch per window.
-static void drainAndPublish() {
-    int pending = (int)uxQueueMessagesWaiting(g_canQueue);
-    do {
-        int taken = publishOneBatch(pending);
-        if (taken <= 0) break;
-        pending -= taken;
-    } while (pending > 0);
-}
 
 // ---- Task ------------------------------------------------------------
 static void netTask(void *) {
-    if (!LittleFS.begin(true)) {
-        Serial.println("[net] LittleFS mount/format failed; spooling disabled");
-    } else if (!LittleFS.exists(SPOOL_DIR)) {
-        LittleFS.mkdir(SPOOL_DIR);
-    } else {
-        initSpoolCounter();
-    }
+    s_htpSessionOk = htpParseUuid(HTP_SESSION_ID, s_htpSession);
+    s_htpConfigOk = htpConfigReady();
+    htpLogConfigOnce();
 
 #if !TELEMETRY_USE_WIFI
     modemPowerPins();
@@ -739,12 +788,6 @@ static void netTask(void *) {
 #if !(TELEMETRY_USE_WIFI && WIFI_AP_MODE)
     // Encrypted, certificate not checked. See HTTPS_INGEST_URL in telemetry_config.h.
     netClient.setInsecure();
-    if (!strlen(HTTPS_INGEST_URL) || !strlen(HTTPS_API_KEY)) {
-        Serial.println("[net] HTTPS_INGEST_URL or HTTPS_API_KEY is empty; "
-                       "batches will spool until .env is set and the board is reflashed");
-    } else {
-        Serial.printf("[net] HTTPS ingest: %s\n", HTTPS_INGEST_URL);
-    }
 #endif
 
     ensureNetworkConnected();
@@ -799,12 +842,7 @@ static void netTask(void *) {
             }
         }
 #endif
-        replaySpooledBatches();
-
-        if (now - s_lastBatchMs >= BATCH_WINDOW_MS) {
-            s_lastBatchMs = now;
-            drainAndPublish();
-        }
+        htpMaintain();
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -813,6 +851,6 @@ static void netTask(void *) {
 void netTaskStart() {
     // TLS handshakes run in mbedTLS on this task's stack. HTTPClient adds another
     // buffer on top of the handshake, so this is larger than the MQTT task was.
-    xTaskCreatePinnedToCore(netTask, "net_task", 16384, nullptr, tskIDLE_PRIORITY + 2,
+    xTaskCreatePinnedToCore(netTask, "net_task", 24576, nullptr, tskIDLE_PRIORITY + 2,
                              nullptr, 1);
 }

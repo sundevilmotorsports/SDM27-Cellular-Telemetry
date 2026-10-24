@@ -1,6 +1,6 @@
 // User-editable configuration for the telemetry PoC.
-// Fill in your APN and HTTPS ingest URL before flashing the real-CAN or
-// cellular-connectivity paths. Batches are POSTed as JSON; there is no broker.
+// Fill in your APN and HTTPS ingest URL before flashing. The uplink is binary
+// HTP/1 to the telemetry-ingest edge function. There is no broker.
 //
 // Credentials (WiFi/APN/HTTPS) below are wrapped in #ifndef guards: copy
 // .env.example to .env (git-ignored) and fill in real values there instead
@@ -168,26 +168,51 @@
 // How long to wait for an IP once the modem has switched to PPP data mode.
 #define PPP_CONNECT_TIMEOUT_MS 30000
 
-// ---- HTTPS ingest ------------------------------------------------------
-// One POST per batch. The body is the JSON from telemetryFormatBatch()
-// (device_id, seq, dropped_frames, frames). For Supabase PostgREST the URL is
-// https://<project-ref>.supabase.co/rest/v1/<table>
-// and HTTPS_API_KEY is the publishable key (sb_publishable_...) or the legacy
-// anon JWT. It is sent as the apikey header. Do not put the secret key here.
+// ---- HTTPS ingest (Helios HTP/1) ---------------------------------------
+// One POST per 1-second window, body is binary HTP/1 for channel set 1.
+// URL is the edge function, not PostgREST:
+//   https://<project-ref>.supabase.co/functions/v1/telemetry-ingest
+// Auth is HMAC-SHA256 of the raw body, sent as x-htp-signature. Do not send
+// apikey, Authorization, or any Supabase secret. The HMAC key is the device
+// key (TELEMETRY_HMAC_KEY), the same value set on the function.
+//
+// HTP_SESSION_ID must already be a row in telemetry.sessions. A random UUID
+// that is not a row is rejected. Channel set 1 must be seeded.
 //
 // TLS runs on the ESP32 (mbedTLS over PPP, or WiFiClientSecure on WiFi STA).
 // netClient.setInsecure() means the link is encrypted but the certificate is
 // not checked. setCACert() would close that gap.
 //
-// Put the real values in .env, not in this file:
-//   HTTPS_INGEST_URL=https://<project-ref>.supabase.co/rest/v1/batches
-//   HTTPS_API_KEY=<anon key>
+// Put the real values in .env, not in this file. An edit without a reflash
+// does nothing. Do not print the HMAC key.
+//   HTTPS_INGEST_URL=https://<project-ref>.supabase.co/functions/v1/telemetry-ingest
+//   TELEMETRY_HMAC_KEY=<device hmac key>
+//   HTP_DEVICE_ID=esp32-sim7670g-poc-01
+//   HTP_SESSION_ID=<uuid of a telemetry.sessions row>
+//   HTP_CHANNEL_SET_ID=1
 #ifndef HTTPS_INGEST_URL
 #define HTTPS_INGEST_URL ""
 #endif
-#ifndef HTTPS_API_KEY
-#define HTTPS_API_KEY ""
+#ifndef TELEMETRY_HMAC_KEY
+#define TELEMETRY_HMAC_KEY ""
 #endif
+#ifndef HTP_DEVICE_ID
+#define HTP_DEVICE_ID "esp32-sim7670g-poc-01"
+#endif
+#ifndef HTP_SESSION_ID
+#define HTP_SESSION_ID ""
+#endif
+#ifndef HTP_CHANNEL_SET_ID
+#define HTP_CHANNEL_SET_ID 1
+#endif
+// 1 = synth samples for every channel in set 1, and do not start the CAN task.
+// Real CAN ids are not mapped yet. Leave this 1 for the first ingest proof.
+#ifndef HTP_SYNTH_MODE
+#define HTP_SYNTH_MODE 1
+#endif
+#define HTP_RETRY_QUEUE_MAX 32
+#define HTP_BACKOFF_INITIAL_MS 1000
+#define HTP_BACKOFF_MAX_MS 8000
 // How long one POST, including the TLS handshake, may take before it is
 // treated as a failure and the batch is spooled.
 #define HTTPS_POST_TIMEOUT_MS 15000

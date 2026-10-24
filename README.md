@@ -237,10 +237,13 @@ Edit `include/telemetry_config.h`:
 | `WIFI_AP_MODE` | Only used when `TELEMETRY_USE_WIFI=1`. `1` = the ESP32-S3 hosts its own network (`WIFI_AP_SSID`/`_PASSWORD`) for your laptop/phone to join directly -- no existing WiFi needed, but no internet uplink either, so batches are spooled and not POSTed, and NTP time sync is skipped. `0` = join an existing network instead (the settings below). |
 | `WIFI_SSID`, `WIFI_ENTERPRISE`, `WIFI_PASSWORD` / `WIFI_EAP_*` | Only used when `TELEMETRY_USE_WIFI=1` and `WIFI_AP_MODE=0`. Set `WIFI_ENTERPRISE=1` for WPA2/WPA3-Enterprise networks (802.1X, e.g. eduroam or a corporate network) that ask for a username **and** password to join directly -- PEAP/MSCHAPv2 only, not EAP-TLS. Leave it `0` for an ordinary single-password network. |
 | `TELEMETRY_APN` / `_USER` / `_PASS` | Your carrier's APN credentials (cellular mode only) |
-| `HTTPS_INGEST_URL` | Full POST URL. For Supabase: `https://<project-ref>.supabase.co/rest/v1/<table>`. Put it in `.env`, not in the header. |
-| `HTTPS_API_KEY` | Sent as the `apikey` header. For Supabase this is `SUPABASE_PUBLISHABLE_KEY` (`sb_publishable_...`), or the legacy anon JWT. Never the secret / `service_role` key. Put it in `.env`. |
-| `TELEMETRY_DEVICE_ID` | Identifies this device in every batch |
-| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES`, `BATCH_MAX_JSON_BYTES` | Batching/backpressure tuning. Every `BATCH_WINDOW_MS` the net task POSTs as many batches as it takes to empty the queue, each capped by `BATCH_MAX_FRAMES` and by `BATCH_MAX_JSON_BYTES` of JSON |
+| `HTTPS_INGEST_URL` | Edge function URL: `https://<project-ref>.supabase.co/functions/v1/telemetry-ingest`. Not `/rest/v1/`. Put it in `.env`, then reflash. |
+| `TELEMETRY_HMAC_KEY` | Device HMAC key. Sent only as `x-htp-signature` over the raw body. Same value as the function's `TELEMETRY_HMAC_KEY`. Never a Supabase secret. Put it in `.env`. |
+| `HTP_DEVICE_ID` | `x-htp-device` header. |
+| `HTP_SESSION_ID` | UUID of an existing `telemetry.sessions` row. A UUID that is not a row is rejected. |
+| `HTP_CHANNEL_SET_ID` | Must be `1` (`SDM26-cell-v1`) until another set is frozen. |
+| `HTP_SYNTH_MODE` | `1` (default) = synth every channel in set 1 and do not start CAN. Real CAN mapping is not wired. |
+| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES`, `BATCH_MAX_JSON_BYTES` | Left over from the JSON CAN path. The HTP uplink does not use them. It sends one 1-second window per POST and keeps 32 windows in RAM. |
 | `TELEMETRY_STRESS_TEST` | Leave `0`. The old MQTT filler burst is not POSTed to the ingest URL. |
 | `MODEM_USB_BENCH_MODE` | `1` = power the modem on and stop -- no registration/MQTT/stress test, UART1 stays silent so a PC can drive the modem directly over its own USB port (see [USB direct-to-modem bench](#usb-direct-to-modem-bench-bypassing-the-esp32-modem-uart)); `0` = normal operation (default). Cellular only. |
 | `SMS_TEST_ENABLED` | `1` = send one test SMS after the modem registers on the network, to `SMS_TEST_NUMBER` (see `include/sms_config.h`); `0` = off (default). Cellular only -- build error under `TELEMETRY_USE_WIFI=1` |

@@ -1,10 +1,6 @@
-// CAN-to-Cellular Telemetry PoC entry point.
-// Two FreeRTOS tasks + a shared queue, per the architecture in README.md:
-//   - CAN task (core 0, high priority): can_handler.cpp
-//   - Net task (core 1): net_task.cpp -- modem, MQTT, batching, spooling
-// Both feed/consume the same CanFrame queue and format regardless of whether
-// TELEMETRY_USE_SIMULATED_CAN selects the synthetic generator or the real
-// TWAI driver -- see can_handler.cpp.
+// CAN-to-Cellular Telemetry entry point.
+// Net task (core 1) posts HTP/1. With HTP_SYNTH_MODE=1 the CAN task is not
+// started; samples are synthesized for channel set 1.
 
 #include <Arduino.h>
 #include "can_handler.h"
@@ -19,9 +15,13 @@ void setup() {
     Serial.printf("Mode: %s CAN\n", TELEMETRY_USE_SIMULATED_CAN ? "simulated"
                                      : CAN_USE_MCP2518FD       ? "real (MCP2518FD, classic + FD)"
                                                                : "real (TWAI, classic only)");
-    Serial.printf("Device ID: %s\n", TELEMETRY_DEVICE_ID);
-
+    Serial.printf("Device ID: %s\n", HTP_DEVICE_ID);
+#if HTP_SYNTH_MODE
+    Serial.println("Uplink: HTP/1 synth for channel set 1 (CAN task not started)");
+#else
+    Serial.println("Uplink: HTP/1, but HTP_SYNTH_MODE=0 and CAN is not mapped onto channels");
     canHandlerStart();
+#endif
     netTaskStart();
 }
 
