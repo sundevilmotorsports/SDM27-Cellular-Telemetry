@@ -18,6 +18,7 @@ struct String : std::string {
     String(const char *s) : std::string(s) {}
     unsigned length() const { return (unsigned)size(); }
     String substring(size_t a, size_t b) const { return String(std::string::substr(a, b - a)); }
+    int indexOf(const char *t) const { size_t p = find(t); return p == npos ? -1 : (int)p; }
 };
 #define deserializeJson(doc, s) deserializeJson(doc, (s).c_str())
 

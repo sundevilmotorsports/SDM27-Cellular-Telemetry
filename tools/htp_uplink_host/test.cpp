@@ -173,6 +173,24 @@ int main() {
     Serial.quiet = false;
     run(10200);
 
+    // 10. Session row missing: 500 FK error is retried, not dropped.
+    Serial.quiet = true;
+    calls = 0;
+    perm = s_htpPermanentErrors;
+    g_reqMs = 100;
+    g_server = [&](const uint8_t *b, size_t n, std::string &r) {
+        if (++calls <= 3) {
+            r = "{\"error\":\"insert failed: insert or update on table \\\"staging_chunks\\\" violates "
+                "foreign key constraint \\\"staging_chunks_session_id_fkey\\\"\"}";
+            return 500;
+        }
+        return goodServer(b, n, r);
+    };
+    run(20000);
+    check(s_htpPermanentErrors == perm, "missing session: nothing dropped");
+    check(queued() <= 3, "missing session: drains once the row exists");
+    printf("10 missing session: %d calls, recovered, queued %d\n", calls, queued());
+
     // 9. ackedCount: partial ack, dup-only, garbage.
     int32_t sm;
     check(ackedCount(String("{\"acked\":[5,6],\"dup\":[7],\"server_recv_ms\":1,\"server_send_ms\":3}"), 5, 3, &sm) == 3 && sm == 2, "ack: acked+dup");

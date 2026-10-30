@@ -808,6 +808,12 @@ static void htpSendNext() {
     if (htpRetryable(code)) {
         Serial.printf("[htp] POST failed HTTP %d after %lu ms, resending g%u seq=%lu+%u\n",
                       code, (unsigned long)reqMs, kHtpGroups[g].key, (unsigned long)first, n);
+        // The function does not create sessions. Keep retrying: once the row
+        // exists the queued windows go through.
+        if (response.indexOf("session_id_fkey") >= 0) {
+            Serial.printf("[htp] session %s is not a telemetry.sessions row; create it "
+                          "(service role) or change HTP_SESSION_ID\n", HTP_SESSION_ID);
+        }
         htpNoteFailure();
         return;
     }
