@@ -92,6 +92,24 @@ static int16_t encodeI16(float value, float scale, float offset) {
     return (int16_t)raw;
 }
 
+void htpWriteHeader(uint8_t *out,
+                    const uint8_t sessionId[16],
+                    uint16_t channelSetId,
+                    uint8_t groupKey,
+                    uint8_t windowCount,
+                    uint32_t firstSeq,
+                    uint64_t sendTimestampMs) {
+    writeU16(out + 0, HTP_MAGIC);
+    out[2] = HTP_VERSION;
+    out[3] = 0;
+    memcpy(out + 4, sessionId, 16);
+    writeU16(out + 20, channelSetId);
+    out[22] = groupKey;
+    out[23] = windowCount;
+    writeU32(out + 24, firstSeq);
+    writeU64(out + 28, sendTimestampMs);
+}
+
 size_t htpEncodeFrame(uint8_t *out, size_t cap,
                       const uint8_t sessionId[16],
                       uint16_t channelSetId,
@@ -108,15 +126,7 @@ size_t htpEncodeFrame(uint8_t *out, size_t cap,
     size_t need = htpFrameBytes(group, windowCount);
     if (need > cap) return 0;
 
-    writeU16(out + 0, HTP_MAGIC);
-    out[2] = HTP_VERSION;
-    out[3] = 0;
-    memcpy(out + 4, sessionId, 16);
-    writeU16(out + 20, channelSetId);
-    out[22] = group->key;
-    out[23] = windowCount;
-    writeU32(out + 24, firstSeq);
-    writeU64(out + 28, sendTimestampMs);
+    htpWriteHeader(out, sessionId, channelSetId, group->key, windowCount, firstSeq, sendTimestampMs);
 
     size_t off = HTP_HEADER_BYTES;
     size_t sampleBase = 0;

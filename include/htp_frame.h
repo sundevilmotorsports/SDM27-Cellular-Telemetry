@@ -18,12 +18,25 @@
 // One window of channel set 1 group 0 is the largest single-window frame
 // (36 + 8 + 22*10*2 = 484). The retry queue stores one window per slot.
 #define HTP_MAX_FRAME_BYTES 512
+// A POST of HTP_MAX_WINDOWS group 0 windows under one header.
+#define HTP_MAX_POST_BYTES (HTP_HEADER_BYTES + HTP_MAX_WINDOWS * (HTP_MAX_FRAME_BYTES - HTP_HEADER_BYTES))
 
 // Printed UUID order (hyphens removed), not the mixed-endian Windows layout.
 bool htpParseUuid(const char *text, uint8_t out[16]);
 
 size_t htpWindowBytes(const HtpGroup *group);
 size_t htpFrameBytes(const HtpGroup *group, uint8_t windowCount);
+
+// Writes the 36-byte header. The firmware queues single-window frames and
+// sends several consecutive ones under a new header: windows are byte-for-byte
+// the same whether they are sent alone or together.
+void htpWriteHeader(uint8_t *out,
+                    const uint8_t sessionId[16],
+                    uint16_t channelSetId,
+                    uint8_t groupKey,
+                    uint8_t windowCount,
+                    uint32_t firstSeq,
+                    uint64_t sendTimestampMs);
 
 // samples is window-major, then channel-major, rate_hz floats each.
 // A non-finite i16fp sample is the dropout sentinel. Returns encoded length,
