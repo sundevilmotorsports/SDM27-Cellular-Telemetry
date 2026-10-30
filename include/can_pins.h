@@ -39,9 +39,12 @@
 
 // CAN FD data-phase bitrate (after the bit rate switch). Arbitration and
 // classic frames use CAN_BITRATE_KBPS below. Must match the transmitting
-// nodes; the transceivers (ATA6561, TJA1051T/3) are rated to 5 Mbit/s, but
-// breadboard wiring is happiest at 2 Mbit/s or less.
-#define CAN_FD_DATA_BITRATE_KBPS 2000
+// nodes. The car's logger (sundevilmotorsports/logger) runs both of its buses
+// at 500 kbit/s nominal / 1 Mbit/s data, so that is the default; the bench C5
+// generator matches it.
+#ifndef CAN_FD_DATA_BITRATE_KBPS
+#define CAN_FD_DATA_BITRATE_KBPS 1000
+#endif
 
 // TWAI pins (CAN_USE_MCP2518FD=0 only)
 #define CAN_TX_PIN   1   // ESP32 TWAI TX -> SN65HVD232D pin 1 (D)
@@ -52,4 +55,6 @@
 // body/comfort buses on some vehicles run at 125 kbit/s or 33.3 kbit/s.
 // TWAI supports 125/250/500/1000; the MCP2518FD any rate dividing 40 MHz
 // between ~125k and 1M.
+#ifndef CAN_BITRATE_KBPS
 #define CAN_BITRATE_KBPS 500
+#endif

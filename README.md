@@ -146,7 +146,7 @@ pins 5 and 8 are simply not connected.
 | CAN Pal | H / L / GND | MCP2518 board | CANH / CANL / GND |
 
 Termination: MCP2518 JP1 solder-bridged and CAN Pal switch ON, giving ~60 Ω
-across CANH/CANL. Bus: 500 kbit/s nominal, 2 Mbit/s FD data. USB ports on
+across CANH/CANL. Bus: 500 kbit/s nominal, 1 Mbit/s FD data (the car's rates). USB ports on
 the Mac: S3 = `/dev/cu.usbmodem101`, C5 = `/dev/cu.usbmodem1101` (native
 USB on both). Test procedure, results and open issues: [bench/README.md](bench/README.md).
 
@@ -251,7 +251,7 @@ Edit `include/telemetry_config.h`:
 
 CAN hardware and bitrates are in `include/can_pins.h`: `CAN_USE_MCP2518FD`
 (default `1`), `CAN_BITRATE_KBPS` (default 500 kbit/s) and
-`CAN_FD_DATA_BITRATE_KBPS` (default 2000 kbit/s, MCP2518FD only) -- **must
+`CAN_FD_DATA_BITRATE_KBPS` (default 1000 kbit/s, MCP2518FD only, matching the car's logger) -- **must
 match the bus you're connecting to**; body/comfort buses on some vehicles
 run at 125 kbit/s or slower, while OBD-II diagnostic CAN is standard at
 500 kbit/s.
