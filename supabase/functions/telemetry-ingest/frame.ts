@@ -89,7 +89,6 @@ export interface DecodedFrame extends FrameHeader {
   windows: DecodedWindow[];
 }
 
-const I16_NULL = -32768;
 const SAMPLE_BYTES: Record<ChannelEncoding, number> = { f32: 4, i16fp: 2 };
 
 /**
@@ -214,9 +213,7 @@ export function decodeFrame(bytes: Uint8Array, def: ChannelSetDefinition): Decod
         const scale = ch.scale ?? 1;
         const offset = ch.offset ?? 0;
         for (let i = 0; i < rateHz; i++) {
-          // INT16_MIN is the dropout sentinel (wire-protocol.md 3.3), never a value.
-          const raw = view.getInt16(off, true);
-          out[i] = raw === I16_NULL ? NaN : raw * scale + offset;
+          out[i] = view.getInt16(off, true) * scale + offset;
           off += 2;
         }
       }
