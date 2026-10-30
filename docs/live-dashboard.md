@@ -16,10 +16,19 @@ publishable key and `scripts/watch_live.py`, driven by
   channel shows up on the live feed at most once per POST, so about 1 Hz in
   steady state. Every sample is stored in `telemetry.staging_chunks`; use
   that for charts that need full resolution.
-- The firmware currently sends **synthetic** data (`HTP_SYNTH_MODE=1`). CAN is
-  not mapped onto channel set 1 yet. Synthetic windows are generated after the
-  second they describe ends and stamped with that second, so `t_us` is a
-  plausible capture time, not a measured one.
+- The default firmware build sends **synthetic** data (`HTP_SYNTH_MODE=1`).
+  With `HTP_SYNTH_MODE=0` it sends CAN values sampled at 10 Hz; the car's
+  signal table is not filled in yet. Either way samples are taken on
+  wall-clock 100 ms ticks and a window is queued right after its .9 s tick,
+  so `t_us` is when the sample was taken.
+- **Dropouts arrive as numbers.** A channel with no data (no CAN signal mapped,
+  no fresh frame, no GPS) is sent as the i16 sentinel `-32768`. The ingest
+  function does not turn it into null; it broadcasts `-32768 * scale + offset`,
+  e.g. `engine.rpm` = -16384, `engine.tps` = -327.68. The dashboard must treat
+  exactly that value as missing (per channel: scale and offset are in the
+  channel table below). f32 channels (GPS) are different: a NaN sample is
+  serialized by `JSON.stringify` as `null`, which a parser that only accepts
+  finite numbers already ignores.
 
 ## Subscribing
 
