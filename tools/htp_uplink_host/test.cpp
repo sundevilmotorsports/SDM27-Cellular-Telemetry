@@ -7,6 +7,19 @@
 #include "telemetry_config.h"
 #include "htp_frame.h"
 #include "section.inc"
+#include "../../src/can_map.cpp"
+#include "../../src/sampler.cpp"
+
+// The sampler "task": one takeSample() per 100 ms epoch boundary.
+static void samplerDrive() {
+    static int64_t last = -1;
+    int64_t nowMs = g_timeSync.epochMsFor(esp_timer_get_time());
+    int64_t tick = nowMs - nowMs % SAMPLER_TICK_MS;
+    if (tick == last) return;
+    if (s_firstSec < 0) s_firstSec = tick / 1000;
+    last = tick;
+    takeSample(tick, esp_timer_get_time());
+}
 
 // Server state: what got staged, per group.
 static std::map<int, std::set<uint32_t>> g_staged;
@@ -48,7 +61,7 @@ static void run(uint32_t ms) {
     uint64_t end = g_nowUs + (uint64_t)ms * 1000;
     while (g_nowUs < end) {
         htpMaintain();
-        g_nowUs += 50000;
+        advanceTime(50000);
     }
 }
 
@@ -63,8 +76,10 @@ static bool contiguous(int g, uint32_t *lo, uint32_t *hi) {
 
 int main() {
     Serial.quiet = true;
+    s_htpLock = xSemaphoreCreateMutex();
     s_htpSessionOk = htpParseUuid(HTP_SESSION_ID, s_htpSession);
     s_htpConfigOk = htpConfigReady() && htpQueuesInit();
+    g_onTick = samplerDrive;
     check(s_htpConfigOk, "config ok");
     g_server = goodServer;
 
@@ -146,8 +161,8 @@ int main() {
     check(queued() <= 3, "400: queue still drains");
     printf("6 400: rejected %lu\n", (unsigned long)(s_htpPermanentErrors - perm));
 
-    // 7. Slow uplink, 1.2 s per POST (3.6 s per second of data): the emitter
-    //    backfills the seconds a POST blocked, POSTs grow to keep up.
+    // 7. Slow uplink, 1.2 s per POST (3.6 s per second of data): the sampler
+    //    keeps ticking while a POST blocks, POSTs grow to keep up.
     g_server = goodServer;
     g_reqMs = 1200;
     before = g_posts.size();
@@ -190,6 +205,34 @@ int main() {
     check(s_htpPermanentErrors == perm, "missing session: nothing dropped");
     check(queued() <= 3, "missing session: drains once the row exists");
     printf("10 missing session: %d calls, recovered, queued %d\n", calls, queued());
+
+    // 11. Queue full and a slow POST: the sampler drops the oldest windows,
+    //     which this POST is carrying, while it is in flight. The ack must
+    //     remove exactly the POSTed seqs that are still queued, not 8 from the
+    //     head (that would silently lose 3 windows nobody POSTed).
+    g_server = goodServer;
+    g_bearer = false;
+    run(40000);
+    check(s_htpQ[0].count == HTP_RETRY_QUEUE_MAX, "in-flight drop: queue full");
+    uint32_t firstQueued = s_htpQ[0].meta[s_htpQ[0].head].seq;
+    g_bearer = true;
+    g_staged.clear();
+    calls = 0;
+    g_server = [&](const uint8_t *b, size_t n, std::string &r) {
+        if (++calls == 1) advanceTime(3000000); // 3 more windows land mid-POST
+        return goodServer(b, n, r);
+    };
+    uint32_t droppedBefore = s_htpDroppedOldest;
+    // Make sure group 0 is POSTed first.
+    run(50);
+    check(s_htpDroppedOldest - droppedBefore >= 3, "in-flight drop: windows dropped mid-POST");
+    check(s_htpQ[0].count == 0 || s_htpQ[0].meta[s_htpQ[0].head].seq == firstQueued + 8,
+          "in-flight drop: head is the first unPOSTed seq");
+    g_server = goodServer;
+    run(15000);
+    check(contiguous(0, &lo, &hi) && lo == firstQueued, "in-flight drop: no window lost after the POST");
+    printf("11 in-flight drop: dropped %lu mid-POST, queue resumed at seq %lu\n",
+           (unsigned long)(s_htpDroppedOldest - droppedBefore), (unsigned long)(firstQueued + 8));
 
     // 9. ackedCount: partial ack, dup-only, garbage.
     int32_t sm;
