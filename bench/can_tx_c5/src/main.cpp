@@ -15,14 +15,22 @@
 //   data[len-1]     : CRC-8 (poly 0x07, init 0) over id (4 bytes LE), ext,
 //                     fd, brs, len (1 byte each), data[0..len-2]
 //
+// ECU mode ('e') instead sends the fixed bench ECU pattern from
+// include/bench_ecu_pattern.h at 10 Hz: real-looking signals (rpm, throttle,
+// brake, g...) that the telemetry node decodes into channel set 1 when built
+// with CAN_MAP_BENCH=1 and HTP_SYNTH_MODE=0.
+//
 // Serial commands (115200): + / - double/halve rate, p pause/resume,
-// b burst 200 frames back-to-back, v toggle per-frame logging.
+// b burst 200 frames back-to-back, v toggle per-frame logging,
+// e toggle ECU mode.
 
 #include <Arduino.h>
 #include <esp_random.h>
 #include <esp_twai.h>
 #include <esp_twai_onchip.h>
 #include <atomic>
+
+#include "../../../include/bench_ecu_pattern.h"
 
 // ---- Pins (ESP32-C5-DevKitC-1, as wired on the bench) ----------------------
 // TWAI goes through the GPIO matrix, so any free pin works. Neither is a C5
@@ -62,7 +70,8 @@ static std::atomic<bool> s_busOff{false};
 static uint8_t s_seq = 0;
 static uint32_t s_queued = 0, s_noSlot = 0, s_busOffSkips = 0;
 static uint32_t s_rateHz = BENCH_TX_RATE_HZ;
-static bool s_paused = false, s_verbose = false;
+static bool s_paused = false, s_verbose = false, s_ecu = false;
+static uint32_t s_ecuStep = 0;
 
 // All callbacks run in ISR context.
 static bool onTxDone(twai_node_handle_t, const twai_tx_done_event_data_t *e, void *) {
@@ -97,29 +106,21 @@ static uint8_t frameCrc(uint32_t id, bool ext, bool fd, bool brs, uint8_t len, c
     return crc8(data, len - 1, crc8(hdr, sizeof hdr));
 }
 
-// waitMs = how long to wait for a free slot; 0 for the paced loop.
-static bool sendRandomFrame(uint32_t waitMs) {
+// Claims the next TX slot. waitMs = how long to wait for one; 0 for the paced loop.
+static TxSlot *takeSlot(uint32_t waitMs) {
     if (s_busOff) {  // the driver rejects transmits until printStatus() recovers the node
         s_busOffSkips++;
-        return false;
+        return nullptr;
     }
     if (xSemaphoreTake(s_freeSlots, pdMS_TO_TICKS(waitMs)) != pdTRUE) {
         s_noSlot++;  // all TX_POOL frames still in flight: almost always "nobody is ACKing"
-        return false;
+        return nullptr;
     }
+    return &s_pool[s_submitted % TX_POOL];
+}
 
-    static const uint8_t kFdLens[] = {2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
-    bool ext = (esp_random() & 3) == 0;
-    uint32_t id = ext ? (esp_random() & 0x1FFFFFFF) : (esp_random() & 0x7FF);
-    bool fd = esp_random() % 10 < 7;
-    bool brs = fd && esp_random() % 10 < 8;
-    uint8_t len = fd ? kFdLens[esp_random() % sizeof kFdLens] : 2 + esp_random() % 7;
-
-    TxSlot &slot = s_pool[s_submitted % TX_POOL];
-    slot.data[0] = s_seq;
-    for (int i = 1; i < len - 1; i++) slot.data[i] = (uint8_t)esp_random();
-    slot.data[len - 1] = frameCrc(id, ext, fd, brs, len, slot.data);
-
+// Transmits slot.data[0..len) and releases the slot on failure.
+static bool submitSlot(TxSlot &slot, uint32_t id, bool ext, bool fd, bool brs, uint8_t len) {
     slot.frame = {};
     slot.frame.header.id = id;
     slot.frame.header.ide = ext;
@@ -136,7 +137,6 @@ static bool sendRandomFrame(uint32_t waitMs) {
         return false;
     }
     s_submitted++;
-    s_seq++;
     s_queued++;
     if (s_verbose) {
         Serial.printf("[tx] %s%s %s 0x%0*lX len=%u data=", fd ? "fd" : "classic", brs ? "+brs" : "",
@@ -145,6 +145,38 @@ static bool sendRandomFrame(uint32_t waitMs) {
         Serial.println();
     }
     return true;
+}
+
+static bool sendRandomFrame(uint32_t waitMs) {
+    TxSlot *slotp = takeSlot(waitMs);
+    if (!slotp) return false;
+    TxSlot &slot = *slotp;
+
+    static const uint8_t kFdLens[] = {2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
+    bool ext = (esp_random() & 3) == 0;
+    uint32_t id = ext ? (esp_random() & 0x1FFFFFFF) : (esp_random() & 0x7FF);
+    bool fd = esp_random() % 10 < 7;
+    bool brs = fd && esp_random() % 10 < 8;
+    uint8_t len = fd ? kFdLens[esp_random() % sizeof kFdLens] : 2 + esp_random() % 7;
+
+    slot.data[0] = s_seq;
+    for (int i = 1; i < len - 1; i++) slot.data[i] = (uint8_t)esp_random();
+    slot.data[len - 1] = frameCrc(id, ext, fd, brs, len, slot.data);
+    if (!submitSlot(slot, id, ext, fd, brs, len)) return false;
+    s_seq++;
+    return true;
+}
+
+// One step of the bench ECU pattern: 0x5F0 (classic) and 0x5F1 (FD + BRS).
+static void sendEcuStep() {
+    BenchEcuFrame e[2];
+    benchEcuFrames(s_ecuStep++, e);
+    for (const BenchEcuFrame &f : e) {
+        TxSlot *slot = takeSlot(0);
+        if (!slot) return;
+        memcpy(slot->data, f.data, f.len);
+        submitSlot(*slot, f.id, false, f.fd, f.fd, f.len);
+    }
 }
 
 static void printStatus() {
@@ -222,7 +254,7 @@ void setup() {
         Serial.printf("[can] TWAI-FD start failed: %s\n", esp_err_to_name(err));
         delay(2000);
     }
-    Serial.printf("[can] TWAI-FD started, TX=%d RX=%d. Commands: + - p b v\n", PIN_CAN_TX, PIN_CAN_RX);
+    Serial.printf("[can] TWAI-FD started, TX=%d RX=%d. Commands: + - p b v e\n", PIN_CAN_TX, PIN_CAN_RX);
 
     // On the bench the generator twice stopped transmitting and printing
     // after minutes of unacknowledged retries (the S3 side was dark). Cause
@@ -240,6 +272,7 @@ void loop() {
         case '-': s_rateHz = max<uint32_t>(s_rateHz / 2, 1); break;
         case 'p': s_paused = !s_paused; break;
         case 'v': s_verbose = !s_verbose; break;
+        case 'e': s_ecu = !s_ecu; break;
         case 'b': {
             // As fast as the bus drains the TX pool; a 20 ms wait for a free
             // slot is ~50 frame times, so a timeout still means "no ACK".
@@ -250,13 +283,19 @@ void loop() {
         }
         default: continue;
         }
-        Serial.printf("[cmd] rate=%luHz paused=%d verbose=%d\n", (unsigned long)s_rateHz, s_paused, s_verbose);
+        Serial.printf("[cmd] rate=%luHz paused=%d verbose=%d ecu=%d\n", (unsigned long)s_rateHz, s_paused,
+                      s_verbose, s_ecu);
         nextTxUs = micros();
     }
 
     if (!s_paused && (int32_t)(micros() - nextTxUs) >= 0) {
-        sendRandomFrame(0);
-        nextTxUs += 1000000UL / s_rateHz;
+        if (s_ecu) {
+            sendEcuStep();
+            nextTxUs += BENCH_ECU_PERIOD_MS * 1000UL;
+        } else {
+            sendRandomFrame(0);
+            nextTxUs += 1000000UL / s_rateHz;
+        }
     }
 
     if (millis() - lastStatusMs >= 2000) {
