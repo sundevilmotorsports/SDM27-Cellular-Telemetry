@@ -92,6 +92,8 @@ channels of one group, so the group is the group of any key in `values`
    So a dropout shows up as that exact number per channel, e.g. -16384 for
    `engine.rpm`, -327.68 for `engine.water_temp`, -32.768 for `imu.lat_g`.
    Treat a value equal to `-32768 * scale + offset` (table below) as missing.
+   Helios's newer Rust codec (`crates/helios-htp` on `feat/telemetry-live-path`)
+   decodes the sentinel to null, so the deployed function is the outlier.
    The same value is what lands in staging. f32 channels have no sentinel.
    The synth never sends dropouts; real CAN data will once it is mapped.
    Values outside the i16fp range are clamped to `+-32767 * scale + offset`,
@@ -112,6 +114,15 @@ channels of one group, so the group is the group of any key in `values`
   creating the row afterwards recovers the queued data (up to 32 s of it).
 - For now the id is flashed into the board (`HTP_SESSION_ID` in `.env`), so
   one session spans every boot until it is changed and reflashed.
+- Planned in Helios (spec `docs/superpowers/specs/2026-09-02-cellular-telemetry-fast-path.md`
+  on `feat/telemetry-live-path`, section 3.4): a `telemetry-session` edge
+  function, HMAC-signed like ingest, that the device calls at boot
+  (`{"action":"open","device_id":...,"channel_set_id":1}` returns a new
+  `session_id`; it first closes any session the same device left open).
+  Not built yet: the branch stops at the protocol crate, and
+  `/functions/v1/telemetry-session` returns 404 on the team project
+  (2026-10-29). Once it exists the board should open a session per boot and
+  can go back to seqs counting from 0.
 
 ## Channel set 1 (`SDM26-cell-v1`)
 
@@ -181,7 +192,19 @@ measured yet.
 
 ## If ~1 Hz is not enough
 
-Not done; listed in the order worth trying, after measuring on the board:
+Helios already has an approved design for this (same spec, sections 2-3):
+a separate `live_fast` stream. The device keeps one WebSocket to Realtime
+and broadcasts every 100 ms on the same topic, event `live_fast`, payload
+`{seq, t_us, t_send_ms, cs, v}` where `v` is base64 of one sample per
+channel in channel-set order (86 bytes for set 1, i16fp sentinel = null).
+Target is under 500 ms sensor to screen. It needs a device JWT and private
+channel policies on `realtime.messages`, neither of which exists yet, so the
+board cannot publish it today. Clients are meant to prefer `live_fast` and
+fall back to `live`. Golden fixtures for the packing are in
+`crates/helios-htp/fixtures/live/` on that branch.
+
+Smaller steps that do not need Helios, in the order worth trying, after
+measuring on the board:
 
 1. Check `busy` and request time on LTE. If requests are slow, look at TLS
    reuse first (`reused x/y` in the stats line).
