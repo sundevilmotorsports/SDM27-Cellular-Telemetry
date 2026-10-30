@@ -51,5 +51,14 @@ size_t htpEncodeFrame(uint8_t *out, size_t cap,
                       const uint64_t *tStartUs,
                       const float *samples);
 
+// Channel set 1 flattened in wire order (group 0, 1, 2; channels in registered
+// order): 22 + 5 + 11. The sampler and the CAN map index channels this way.
+#define HTP_CHANNEL_TOTAL 38
+
+// Flat index of a channel id, or -1 if it is not in the set.
+int htpFlatIndex(const char *id);
+// Flat index of a group's first channel.
+int htpGroupFlatOffset(int group);
+
 // Bench signal. Same branch order as tools/htp.mjs synth().
 float htpSynth(const char *id, float tSeconds);

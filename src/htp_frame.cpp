@@ -154,6 +154,23 @@ size_t htpEncodeFrame(uint8_t *out, size_t cap,
     return off == need ? need : 0;
 }
 
+int htpGroupFlatOffset(int group) {
+    int off = 0;
+    for (int g = 0; g < group && g < HTP_GROUP_COUNT; g++) off += kHtpGroups[g].channel_count;
+    return off;
+}
+
+int htpFlatIndex(const char *id) {
+    if (!id) return -1;
+    int i = 0;
+    for (int g = 0; g < HTP_GROUP_COUNT; g++) {
+        for (uint8_t c = 0; c < kHtpGroups[g].channel_count; c++, i++) {
+            if (std::strcmp(kHtpGroups[g].channels[c].id, id) == 0) return i;
+        }
+    }
+    return -1;
+}
+
 static bool idHas(const char *id, const char *part) {
     return id && part && std::strstr(id, part) != nullptr;
 }
