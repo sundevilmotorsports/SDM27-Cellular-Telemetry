@@ -1,0 +1,3 @@
+Copied from NIXELFi/helios branch feat/telemetry-live-path, commit 44ff01e
+(crates/helios-htp/fixtures). Do not edit; re-copy when Helios regenerates them.
+Check: sh tools/check_helios_fixtures.sh
