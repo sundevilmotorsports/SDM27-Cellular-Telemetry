@@ -343,6 +343,7 @@ stale socket); the rest read `.env` and talk to the real project:
 
 ```sh
 sh tools/htp_uplink_host/run.sh
+sh tools/check_helios_fixtures.sh                          # encoder vs Helios golden frames
 c++ -std=c++17 -O2 -Iinclude tools/htp_emit_sample.cpp src/htp_frame.cpp -o tools/htp_emit_sample
 .venv/bin/python scripts/post_synth_htp.py                 # one second, 3 POSTs
 .venv/bin/python scripts/post_synth_htp.py --windows 8     # one 8-window frame per group
