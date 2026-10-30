@@ -20,7 +20,8 @@ real classic and CAN FD frames instead of `TELEMETRY_USE_SIMULATED_CAN=1`:
   transceiver; the S3 talks to it over SPI. Firmware: the main project in
   the repo root, with `CAN_USE_MCP2518FD=1` (the default).
 - Both controllers default to ISO CAN FD, and both transceivers are rated to
-  5 Mbit/s. The bus runs 500 kbit/s arbitration / 2 Mbit/s data.
+  5 Mbit/s. The bus runs 500 kbit/s arbitration / 1 Mbit/s data, matching the car's
+  logger (it was 2 Mbit/s for the measurements below).
 
 ## Wiring
 
@@ -74,7 +75,7 @@ means one terminator is missing; about 40Ω means there's an extra one.
    `pio run -t upload && pio device monitor`. Look for:
    ```
    [mcp] nominal 500000 bit/s (80 TQ, sp 80%), data 2000000 bit/s (20 TQ, sp 80%), RX FIFO 26 x 64B
-   [can] MCP2518FD started, 500 kbit/s nominal, 2000 kbit/s FD data
+   [can] MCP2518FD started, 500 kbit/s nominal, 1000 kbit/s FD data
    [can] rx=0 state=ok rec=0 tec=0 fifo_overflows=0
    ```
 2. **Generator (C5).** Run `cd bench/can_tx_c5 && pio run -t upload &&
@@ -124,7 +125,7 @@ high-rate runs with `TELEMETRY_USE_WIFI=1`, not on a metered SIM.
 | S3: MCP2518FD starts fine but `rx=0` with no errors, while the C5 shows only `ack_errors` | The MCP board's VCC is on 3.3V instead of VIN. Its LDO still runs the MCP2518FD (so SPI works), but the ATA6561 needs 4.5V or more and stays off the bus. We hit exactly this |
 | C5: `bus_errors` climbing, zero `ack_errors`, then bus-off | The C5 never sees its own bits on RX: the CAN Pal is unpowered, SLNT isn't tied low, or TX/RX aren't on the pins in `PIN_CAN_TX`/`PIN_CAN_RX` |
 | C5: `ack_errors` climbing, `sent_ok=0`, `no_slot` climbing | Nobody is ACKing. Check that the S3 printed `MCP2518FD started`, CAN Pal SLNT is on GND, and CANH/CANL aren't swapped |
-| C5 `bus_errors` and/or S3 `errors=fd-crc,fd-stuff,...` | Only the 2 Mbit/s data phase is failing. Suspect wiring/termination (measure the 60Ω), or a bitrate mismatch between `can_pins.h` and `can_tx_c5/platformio.ini`. Try `-DBENCH_CAN_FD_DATA_BITRATE=1000000` and `CAN_FD_DATA_BITRATE_KBPS 1000` |
+| C5 `bus_errors` and/or S3 `errors=fd-crc,fd-stuff,...` | Only the FD data phase is failing. Suspect wiring/termination (measure the 60Ω), or a bitrate mismatch between `can_pins.h` and `can_tx_c5/platformio.ini`. Both default to 1 Mbit/s (`BENCH_CAN_FD_DATA_BITRATE`, `CAN_FD_DATA_BITRATE_KBPS`); they must match |
 | S3: `errors=crc,stuff,form` (no `fd-` prefix) | The arbitration phase is failing: nominal bitrate mismatch or bad wiring |
 | S3: `fifo_overflows` > 0 | The S3's CAN task fell behind the controller's 26-frame FIFO |
 | S3 `rx` climbs, but the verifier sees nothing | Network/MQTT side: look for `[net]` lines on the S3 (e.g. `SIM: no answer -- SIM missing?`; insert the SIM before powering on), or check with `python3 listener.py -b`. Batches spool to flash meanwhile and replay once MQTT connects |

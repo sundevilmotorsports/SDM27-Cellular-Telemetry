@@ -146,7 +146,7 @@ pins 5 and 8 are simply not connected.
 | CAN Pal | H / L / GND | MCP2518 board | CANH / CANL / GND |
 
 Termination: MCP2518 JP1 solder-bridged and CAN Pal switch ON, giving ~60 Ω
-across CANH/CANL. Bus: 500 kbit/s nominal, 2 Mbit/s FD data. USB ports on
+across CANH/CANL. Bus: 500 kbit/s nominal, 1 Mbit/s FD data (the car's rates). USB ports on
 the Mac: S3 = `/dev/cu.usbmodem101`, C5 = `/dev/cu.usbmodem1101` (native
 USB on both). Test procedure, results and open issues: [bench/README.md](bench/README.md).
 
@@ -234,20 +234,26 @@ Edit `include/telemetry_config.h`:
 |---|---|
 | `TELEMETRY_USE_SIMULATED_CAN` | `1` = synthetic frames (no CAN hardware needed), `0` = real CAN (MCP2518FD or TWAI, per `CAN_USE_MCP2518FD` in `include/can_pins.h`) |
 | `TELEMETRY_USE_WIFI` | `1` = transmit over the ESP32-S3's onboard WiFi radio instead of the cellular modem (bench testing without a SIM); `0` = cellular (default, real deployment path) |
-| `WIFI_AP_MODE` | Only used when `TELEMETRY_USE_WIFI=1`. `1` = the ESP32-S3 hosts its own network (`WIFI_AP_SSID`/`_PASSWORD`) for your laptop/phone to join directly -- no existing WiFi needed, but no internet uplink either, so batches are spooled and not POSTed, and NTP time sync is skipped. `0` = join an existing network instead (the settings below). |
+| `WIFI_AP_MODE` | Only used when `TELEMETRY_USE_WIFI=1`. `1` = the ESP32-S3 hosts its own network (`WIFI_AP_SSID`/`_PASSWORD`) for your laptop/phone to join directly -- no existing WiFi needed, but no internet uplink either, so nothing is POSTed, and NTP time sync is skipped (so the sampler never starts). `0` = join an existing network instead (the settings below). |
 | `WIFI_SSID`, `WIFI_ENTERPRISE`, `WIFI_PASSWORD` / `WIFI_EAP_*` | Only used when `TELEMETRY_USE_WIFI=1` and `WIFI_AP_MODE=0`. Set `WIFI_ENTERPRISE=1` for WPA2/WPA3-Enterprise networks (802.1X, e.g. eduroam or a corporate network) that ask for a username **and** password to join directly -- PEAP/MSCHAPv2 only, not EAP-TLS. Leave it `0` for an ordinary single-password network. |
 | `TELEMETRY_APN` / `_USER` / `_PASS` | Your carrier's APN credentials (cellular mode only) |
-| `HTTPS_INGEST_URL` | Full POST URL. For Supabase: `https://<project-ref>.supabase.co/rest/v1/<table>`. Put it in `.env`, not in the header. |
-| `HTTPS_API_KEY` | Sent as the `apikey` header. For Supabase this is `SUPABASE_PUBLISHABLE_KEY` (`sb_publishable_...`), or the legacy anon JWT. Never the secret / `service_role` key. Put it in `.env`. |
-| `TELEMETRY_DEVICE_ID` | Identifies this device in every batch |
-| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES`, `BATCH_MAX_JSON_BYTES` | Batching/backpressure tuning. Every `BATCH_WINDOW_MS` the net task POSTs as many batches as it takes to empty the queue, each capped by `BATCH_MAX_FRAMES` and by `BATCH_MAX_JSON_BYTES` of JSON |
+| `HTTPS_INGEST_URL` | Edge function URL: `https://<project-ref>.supabase.co/functions/v1/telemetry-ingest`. Not `/rest/v1/`. Put it in `.env`, then reflash. |
+| `TELEMETRY_HMAC_KEY` | Device HMAC key. Sent only as `x-htp-signature` over the raw body. Same value as the function's `TELEMETRY_HMAC_KEY`. Never a Supabase secret. Put it in `.env`. |
+| `HTP_DEVICE_ID` | `x-htp-device` header. |
+| `HTP_SESSION_ID` | UUID of an existing `telemetry.sessions` row. The row is created out of band with the service role (the Helios dev kit's `npm run session`; Postgres generates the UUID); the ingest function never creates one. An id that is not a row gets HTTP 500 on every POST. See `docs/live-dashboard.md` "Sessions". |
+| `HTP_CHANNEL_SET_ID` | Must be `1` (`SDM26-cell-v1`) until another set is frozen. |
+| `HTP_SYNTH_MODE` | `1` (default) = synth every channel in set 1 and do not start CAN. `0` = sample real (or simulated) CAN through the CAN map. |
+| `CAN_MAP_BENCH` | `0` (default) = car signal table `include/can_map_car.h` (empty until generated from the logger config). `1` = bench table, decodes the C5's ECU pattern and the simulated CAN source. |
+| `CAN_STALE_MS` | A CAN channel not received for this long is sent as a dropout, not its last value. Default 1500. |
+| `HTP_POST_MAX_WINDOWS` | Windows per POST, 1..8 (default 8). Each group keeps up to `HTP_RETRY_QUEUE_MAX` (32) one-second windows in RAM; a POST sends as many consecutive ones of a group as are queued, up to this. |
+| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES`, `BATCH_MAX_JSON_BYTES` | Left over from the JSON CAN path. The HTP uplink does not use them. |
 | `TELEMETRY_STRESS_TEST` | Leave `0`. The old MQTT filler burst is not POSTed to the ingest URL. |
 | `MODEM_USB_BENCH_MODE` | `1` = power the modem on and stop -- no registration/MQTT/stress test, UART1 stays silent so a PC can drive the modem directly over its own USB port (see [USB direct-to-modem bench](#usb-direct-to-modem-bench-bypassing-the-esp32-modem-uart)); `0` = normal operation (default). Cellular only. |
 | `SMS_TEST_ENABLED` | `1` = send one test SMS after the modem registers on the network, to `SMS_TEST_NUMBER` (see `include/sms_config.h`); `0` = off (default). Cellular only -- build error under `TELEMETRY_USE_WIFI=1` |
 
 CAN hardware and bitrates are in `include/can_pins.h`: `CAN_USE_MCP2518FD`
 (default `1`), `CAN_BITRATE_KBPS` (default 500 kbit/s) and
-`CAN_FD_DATA_BITRATE_KBPS` (default 2000 kbit/s, MCP2518FD only) -- **must
+`CAN_FD_DATA_BITRATE_KBPS` (default 1000 kbit/s, MCP2518FD only, matching the car's logger) -- **must
 match the bus you're connecting to**; body/comfort buses on some vehicles
 run at 125 kbit/s or slower, while OBD-II diagnostic CAN is standard at
 500 kbit/s.
@@ -293,6 +299,106 @@ involved.
    (`192.168.4.2:9001`) or point them at your own broker's WebSocket
    listener, and click Connect. Renders each batch's `frames[]` as a live
    table plus running batch/seq/dropped-frame counters.
+
+## Supabase uplink (HTP/1)
+
+The board POSTs binary HTP/1 to the `telemetry-ingest` edge function
+(`docs/wire-protocol.md`). The function stages every window in
+`telemetry.staging_chunks` and broadcasts the latest sample of each POST on
+Realtime topic `telemetry:live:{session_id}`. The dashboard side of that
+broadcast is in [`docs/live-dashboard.md`](docs/live-dashboard.md).
+
+**Status (2026-10-29):** the default build still sends synthetic samples
+(`HTP_SYNTH_MODE=1`). The CAN path (`HTP_SYNTH_MODE=0`) is built and
+host-tested against the bench table, but the car's signal table is empty
+until it is generated from the logger's `config.json`. The session is the
+fixed `HTP_SESSION_ID`; starting sessions from the dashboard is not built.
+The host tools below were run against the team project; the board itself
+has not posted over LTE with this firmware yet.
+
+How the board samples and sends:
+
+- A sampler task ticks at 10 Hz on wall-clock 100 ms boundaries once SNTP
+  has synced. Each tick snapshots every channel (synth, or the latest CAN
+  value); 1 Hz channels use the tick at :00. After the tick at .9 s the
+  second's window for each group (3 groups) is queued. It runs apart from
+  the net task, so a slow POST never stalls sampling.
+- `seq` is the window's unix second, so a reboot with the same
+  `HTP_SESSION_ID` never collides with data already stored (the server would
+  ack a reused seq as `dup` and keep the old window).
+- POSTs go one at a time, oldest queued window first. If the uplink falls
+  behind, a POST carries up to `HTP_POST_MAX_WINDOWS` consecutive windows of
+  one group, so the request rate drops while it catches up.
+- A kept-alive TLS socket that the server has closed is retried once on a
+  new connection before backing off.
+
+What it prints (lines from the host test below, with a fake 300 ms server,
+not from the board):
+
+```
+[htp] g0 seq=1793320172+2 (932 B) 200 in 300 ms (server 42 ms, reused) age=1150 ms queued=0/0/0
+[htp] stats 10s: posts 29 ok/0 failed, 31 windows (3.1/s), req avg 300 max 300 ms, busy 86%, reused 29/29, queued 1/1/0, oldest 300 ms, dropped 57, rejected 1
+```
+
+`age` is how old the newest sample in the POST was when the ack came back
+(about what the dashboard sees). `busy` is the share of time spent inside
+POSTs: near 100% the queues grow and `oldest` climbs. `reused` counts
+requests that skipped the TLS handshake.
+
+Host checks (no board needed). The first runs the queue logic of
+`net_task.cpp` against a fake server and clock (batching, retries, drops,
+stale socket); the rest read `.env` and talk to the real project:
+
+```sh
+sh tools/htp_uplink_host/run.sh
+sh tools/check_helios_fixtures.sh                          # encoder vs Helios golden frames
+c++ -std=c++17 -O2 -Iinclude tools/htp_emit_sample.cpp src/htp_frame.cpp -o tools/htp_emit_sample
+.venv/bin/python scripts/post_synth_htp.py                 # one second, 3 POSTs
+.venv/bin/python scripts/post_synth_htp.py --windows 8     # one 8-window frame per group
+.venv/bin/python scripts/post_synth_htp.py --seconds 30    # 1 Hz like the board
+.venv/bin/python scripts/watch_live.py --seconds 40        # subscribe like a browser
+```
+
+`watch_live.py` uses the publishable key (`HTTPS_API_KEY` in `.env`) and
+prints each broadcast's arrival interval and age per group, flagging any
+that arrive older than one already shown.
+
+### CAN to channel set 1
+
+The CAN task decodes every frame straight into `can_map` (latest value and
+receive time per channel); there is no frame queue. Signals use the car
+logger's definition (sundevilmotorsports/logger `src/can.rs`): bytes
+`start..start+len`, little-endian unless `big_endian`, optional sign,
+optional mux byte, `value = scale * (raw - offset)`. Generate the car table
+from the logger's SD-card `config.json`:
+
+```sh
+python3 tools/logger_config_to_can_map.py config.json --bus Engine > include/can_map_car.h
+python3 tools/logger_config_to_can_map.py config.json --map "Oil P=engine.oil_pressure" ...
+```
+
+Names are matched to channel ids through `aliases:` in `docs/channels.yaml`;
+unmatched signals are listed. A channel never received, or not received for
+`CAN_STALE_MS`, is sent as a dropout (NaN -> i16 `-32768`), never as 0 or as
+a frozen value. The logger itself writes 0 for never-seen signals and keeps
+stale values, so the two records can differ there. With `HTP_SYNTH_MODE=0`
+the board prints a `[can-map]` line every 5 s (frames seen/matched, fresh
+channels, a few values), which works before the clock syncs.
+
+Bench check without the car: build the S3 with `HTP_SYNTH_MODE=0
+CAN_MAP_BENCH=1 TELEMETRY_USE_SIMULATED_CAN=0`, press `e` on the C5's serial
+console (ECU pattern, `include/bench_ecu_pattern.h`), and watch the
+`[can-map]` line show rpm, tps, water temp, gear, brakes and g. Leaving
+`TELEMETRY_USE_SIMULATED_CAN=1` sends the same pattern with no bus at all.
+
+### Power loss
+
+The board is expected to lose power with no shutdown. It writes nothing to
+flash at runtime (no spool, no settings), so a cut cannot corrupt anything.
+What is lost is the RAM queue: up to `HTP_RETRY_QUEUE_MAX` seconds per group
+that were not yet acked, plus the second being sampled. The car's logger is
+the full record; the uplink is for live viewing. On the next boot the board
+continues the same session with new seqs (unix seconds).
 
 ## Demonstration checklist (real CAN hardware)
 

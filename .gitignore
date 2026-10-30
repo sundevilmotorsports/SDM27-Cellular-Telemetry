@@ -3,6 +3,16 @@
 .DS_Store
 .env
 .venv/
+tools/htp_encode_host
+tools/htp_emit_sample
+tools/.htp_sample/
+
+# Supabase CLI local link state. functions/ and config.toml stay tracked.
+supabase/.temp/
+supabase/.branches/
+.env.keys
+.env.local
+.env.*.local
 CLAUDE.md
 __pycache__/
 .mosquitto/
