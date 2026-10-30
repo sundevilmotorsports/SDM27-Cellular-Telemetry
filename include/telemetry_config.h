@@ -18,17 +18,16 @@
 #define TELEMETRY_USE_SIMULATED_CAN 1
 #endif
 
-// Simulated CAN generator settings (only used when
-// TELEMETRY_USE_SIMULATED_CAN=1)
-// NOTE: these rates are deliberately far below a real bus's. On a metered SIM
-// the generator rate, not the batching, sets your data bill: every simulated
-// frame costs ~90 bytes of JSON on the wire. 100+5 Hz (the original bench
-// values, fine over WiFi) works out to ~34 MB/hour. Raise these only when the
-// link is unmetered.
-#define SIM_CAN_FAST_ID 0x100 // e.g. wheel speed / RPM, high rate
-#define SIM_CAN_FAST_RATE_HZ 1
-#define SIM_CAN_SLOW_ID 0x200 // e.g. status frame, low rate
-#define SIM_CAN_SLOW_RATE_HZ 1
+// Simulated CAN source (TELEMETRY_USE_SIMULATED_CAN=1, HTP_SYNTH_MODE=0):
+// sends the bench ECU pattern (include/bench_ecu_pattern.h) at 10 Hz plus a
+// counter frame on this id. Build with CAN_MAP_BENCH=1 to decode them.
+#define SIM_CAN_FAST_ID 0x100
+
+// A CAN channel not received for this long is sent as a dropout instead of
+// its last value. Above 1 s so a 1 Hz frame with some jitter stays fresh.
+#ifndef CAN_STALE_MS
+#define CAN_STALE_MS 1500
+#endif
 
 // ---- Uplink stress test ---------------------------------------------------
 // Opt-in, off by default. The burst used to publish filler over MQTT. That
@@ -91,8 +90,8 @@
 // Only used when TELEMETRY_USE_WIFI=1.
 // 1 = SoftAP -- the ESP32-S3 hosts its own WiFi network (WIFI_AP_SSID/
 //     _PASSWORD below); your laptop/phone joins IT. No existing WiFi network
-//     needed, but there is no route to the ingest host either, so batches are
-//     spooled and not POSTed. Timestamps will NOT be network-synced in this
+//     needed, but there is no route to the ingest host either, so nothing is
+//     POSTed. Timestamps will NOT be network-synced in this
 //     mode (no internet uplink for NTP); relative inter-frame timing is
 //     unaffected, see README's Known Limitations.
 // 0 = station -- the ESP32-S3 joins an existing WiFi network (WIFI_SSID
@@ -207,7 +206,9 @@
 #define HTP_CHANNEL_SET_ID 1
 #endif
 // 1 = synth samples for every channel in set 1, and do not start the CAN task.
-// Real CAN ids are not mapped yet. Leave this 1 for the first ingest proof.
+// 0 = sample the CAN map (can_map.h): channels come from the table picked by
+//     CAN_MAP_BENCH. The car table is empty until it is generated from the
+//     logger's config.json, so with 0 and no table every channel is a dropout.
 #ifndef HTP_SYNTH_MODE
 #define HTP_SYNTH_MODE 1
 #endif
@@ -225,7 +226,7 @@
 #define HTP_BACKOFF_INITIAL_MS 1000
 #define HTP_BACKOFF_MAX_MS 8000
 // How long one POST, including the TLS handshake, may take before it is
-// treated as a failure and the batch is spooled.
+// treated as a failure and retried after a backoff.
 #define HTTPS_POST_TIMEOUT_MS 15000
 
 // ---- Device identity -----------------------------------------------

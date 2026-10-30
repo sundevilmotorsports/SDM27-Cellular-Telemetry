@@ -1,117 +1,63 @@
 #include "can_handler.h"
+#include "can_map.h"
 #include "can_pins.h"
 #include "telemetry_config.h"
 #include <Arduino.h>
 #include <esp_timer.h>
-#include <atomic>
 #include <algorithm>
 #include <cstring>
 
-#include <freertos/idf_additions.h>
-
 #if TELEMETRY_USE_SIMULATED_CAN
+#include "bench_ecu_pattern.h"
 #elif CAN_USE_MCP2518FD
 #include "mcp2518fd.h"
 #else
 #include <driver/twai.h>
 #endif
 
-QueueHandle_t g_canQueue = nullptr;
-static std::atomic<uint32_t> s_droppedFrames{0};
-
-uint32_t canHandlerTakeDroppedCount() {
-    return s_droppedFrames.exchange(0);
-}
-
-// CanFrame has room for a 64-byte CAN FD payload (~80 bytes), so the queue is
-// ~40 KB: keep it in PSRAM when the board has it, leaving internal RAM to
-// WiFi/PPP/TLS. Only tasks touch the queue (never an ISR), which is what
-// makes PSRAM backing safe.
-static void createQueue() {
-    if (psramFound()) {
-        g_canQueue = xQueueCreateWithCaps(CAN_QUEUE_DEPTH, sizeof(CanFrame), MALLOC_CAP_SPIRAM);
-    }
-    if (!g_canQueue) {
-        g_canQueue = xQueueCreate(CAN_QUEUE_DEPTH, sizeof(CanFrame));
-    }
-}
-
-// Pushes a captured frame onto the shared queue without blocking. If full,
-// drops the oldest queued frame first (never the CAN task itself).
-//
-// The evict-then-retry is a loop rather than a straight-line
-// send/receive/send because the net task drains this same queue from the
-// other core (net_task.cpp's drainAndPublish), truly in parallel -- this
-// task's higher priority does not serialize the two. A slot can therefore
-// free up between a failed send and the eviction below, and evicting
-// unconditionally in that case would discard a live frame, and report a
-// drop, that overflow never actually forced. Re-testing the send each pass
-// evicts only when the queue is still genuinely full.
-//
-// Terminates in at most a couple of passes: this is the only producer, so
-// once a slot is freed (or the consumer has emptied the queue outright)
-// nothing can refill it ahead of the retry.
+// Every received frame updates the CAN map in place; there is no frame queue.
+// The sampler reads the latest values at 10 Hz, so a frame costs one table
+// scan here and nothing on the uplink.
 static void pushFrame(const CanFrame &frame) {
-    while (xQueueSend(g_canQueue, &frame, 0) != pdTRUE) {
-        CanFrame discard;
-        if (xQueueReceive(g_canQueue, &discard, 0) == pdTRUE) {
-            s_droppedFrames.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
+    canMapApply(frame);
 }
 
 #if TELEMETRY_USE_SIMULATED_CAN
 
-// Generates two synthetic streams (a fast one and a slow one) so the
-// timestamp/batching path can be exercised without CAN hardware. Uses a
-// single task with a tight scheduling loop rather than two timers, so both
-// streams share the same capture-timestamp code path as the real driver.
+// Sends the bench ECU pattern (include/bench_ecu_pattern.h, the same frames
+// the C5 generator sends with 'e') every BENCH_ECU_PERIOD_MS, plus a counter
+// frame on SIM_CAN_FAST_ID, through the same path as received frames. Decoded
+// only with CAN_MAP_BENCH=1; the car table ignores these ids.
 static void canSimTask(void *) {
-    const int64_t fastPeriodUs = 1000000LL / SIM_CAN_FAST_RATE_HZ;
-    const int64_t slowPeriodUs = 1000000LL / SIM_CAN_SLOW_RATE_HZ;
-    int64_t nextFast = esp_timer_get_time();
-    int64_t nextSlow = nextFast;
-    uint32_t counter = 0;
-
+    uint32_t step = 0;
+    TickType_t wake = xTaskGetTickCount();
     for (;;) {
-        int64_t now = esp_timer_get_time();
-
-        if (now >= nextFast) {
+        BenchEcuFrame ecu[2];
+        benchEcuFrames(step, ecu);
+        for (const BenchEcuFrame &e : ecu) {
             CanFrame f{};
-            f.id = SIM_CAN_FAST_ID;
-            f.extended = false;
-            f.dlc = 8;
-            f.data[0] = (uint8_t)(counter & 0xFF);
-            f.data[1] = (uint8_t)((counter >> 8) & 0xFF);
-            memset(&f.data[2], 0, 6);
-            f.capture_us = esp_timer_get_time(); // captured at push time, not at nextFast
-            pushFrame(f);
-            nextFast += fastPeriodUs;
-        }
-
-        if (now >= nextSlow) {
-            CanFrame f{};
-            f.id = SIM_CAN_SLOW_ID;
-            f.extended = false;
-            f.dlc = 4;
-            f.data[0] = 0xAA;
-            f.data[1] = (uint8_t)(counter & 0xFF);
-            memset(&f.data[2], 0, 2);
+            f.id = e.id;
+            f.fd = e.fd;
+            f.brs = e.fd;
+            f.dlc = e.len;
+            memcpy(f.data, e.data, e.len);
             f.capture_us = esp_timer_get_time();
             pushFrame(f);
-            nextSlow += slowPeriodUs;
         }
-
-        counter++;
-        int64_t sleepUs = std::min(nextFast, nextSlow) - esp_timer_get_time();
-        if (sleepUs > 0) {
-            vTaskDelay(pdMS_TO_TICKS(std::max<int64_t>(1, sleepUs / 1000)));
-        }
+        CanFrame c{};
+        c.id = SIM_CAN_FAST_ID;
+        c.dlc = 8;
+        c.data[0] = (uint8_t)step;
+        c.data[1] = (uint8_t)(step >> 8);
+        c.capture_us = esp_timer_get_time();
+        pushFrame(c);
+        step++;
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(BENCH_ECU_PERIOD_MS));
     }
 }
 
 void canHandlerStart() {
-    createQueue();
+    canMapInit();
     xTaskCreatePinnedToCore(canSimTask, "can_sim", 4096, nullptr,
                              configMAX_PRIORITIES - 2, nullptr, 0);
 }
@@ -218,7 +164,7 @@ static void canMcpTask(void *) {
 }
 
 void canHandlerStart() {
-    createQueue();
+    canMapInit();
     xTaskCreatePinnedToCore(canMcpTask, "can_mcp", 4096, nullptr,
                              configMAX_PRIORITIES - 2, nullptr, 0);
 }
@@ -299,7 +245,7 @@ static void canTwaiTask(void *) {
 }
 
 void canHandlerStart() {
-    createQueue();
+    canMapInit();
     xTaskCreatePinnedToCore(canTwaiTask, "can_twai", 4096, nullptr,
                              configMAX_PRIORITIES - 2, nullptr, 0);
 }

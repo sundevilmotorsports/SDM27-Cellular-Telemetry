@@ -52,8 +52,8 @@ static uint32_t s_lastTimeSyncMs = 0;
 // The ESP32-S3 hosts its own network instead of joining one. No internet
 // uplink exists in this mode, so NTP time sync is skipped entirely -- only
 // relative (inter-frame) timing stays accurate, per README's Known
-// Limitations. There is also no route to HTTPS_INGEST_URL, so batches are
-// spooled and not POSTed until the board joins a network that can reach it.
+// Limitations. There is also no route to HTTPS_INGEST_URL, so nothing is
+// POSTed in this mode.
 static bool s_apStarted = false;
 
 static void wifiConnectBlocking() {
@@ -63,7 +63,7 @@ static void wifiConnectBlocking() {
     s_apStarted = WiFi.softAP(WIFI_AP_SSID, strlen(WIFI_AP_PASSWORD) ? WIFI_AP_PASSWORD : nullptr);
     if (s_apStarted) {
         Serial.printf("[net] AP up, IP: %s -- no route to the ingest host from here; "
-                      "batches will spool until the board has internet\n",
+                      "nothing is posted in AP mode\n",
                       WiFi.softAPIP().toString().c_str());
     } else {
         Serial.println("[net] failed to start WiFi AP");
@@ -522,8 +522,8 @@ static uint32_t s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
 static uint32_t s_htpNextSendMs = 0;
 static uint32_t s_htpDroppedOldest = 0;
 static uint32_t s_htpPermanentErrors = 0;
-static int64_t s_htpLastWindowSec = -1;
-static int64_t s_htpFirstWindowSec = -1;
+// The sampler task enqueues, this task builds POSTs and dequeues.
+static SemaphoreHandle_t s_htpLock = nullptr;
 static bool s_htpLastReused = false;
 static uint8_t s_htpSession[16];
 static bool s_htpSessionOk = false;
@@ -585,6 +585,16 @@ static void htpDequeue(HtpGroupQueue &q, int n) {
     q.count -= n;
 }
 
+// Removes the windows a finished POST covered. The sampler may have dropped
+// some of them (queue full) while the POST was in flight, so this matches by
+// seq instead of removing a count from the head.
+static void htpDequeueRange(HtpGroupQueue &q, uint32_t first, uint8_t n) {
+    xSemaphoreTake(s_htpLock, portMAX_DELAY);
+    while (q.count > 0 && q.meta[q.head].seq - first < n) htpDequeue(q, 1);
+    xSemaphoreGive(s_htpLock);
+}
+
+// Caller holds s_htpLock.
 static void htpEnqueue(int g, uint32_t seq, uint64_t tStartUs, const uint8_t *frame, size_t len) {
     HtpGroupQueue &q = s_htpQ[g];
     if (!q.bytes || len != HTP_HEADER_BYTES + q.windowBytes) return;
@@ -617,16 +627,18 @@ static int64_t htpNowMs() {
 
 // Age of the oldest queued window's last sample, in ms. 0 when nothing is queued.
 static int64_t htpOldestAgeMs() {
+    xSemaphoreTake(s_htpLock, portMAX_DELAY);
     int g = htpOldestGroup();
+    uint64_t startUs = g < 0 ? 0 : s_htpQ[g].meta[s_htpQ[g].head].tStartUs;
+    xSemaphoreGive(s_htpLock);
     if (g < 0) return 0;
-    const HtpGroupQueue &q = s_htpQ[g];
-    return htpNowMs() - (int64_t)(q.meta[q.head].tStartUs / 1000ULL) - 1000;
+    return htpNowMs() - (int64_t)(startUs / 1000ULL) - 1000;
 }
 
 // Copies consecutive seqs from the head of group g into s_htpPost under one
 // header. send_timestamp_ms is the time of this attempt, not of encoding, so a
 // retried frame does not report its queue wait as network latency.
-static uint8_t htpBuildPost(int g, size_t *len) {
+static uint8_t htpBuildPost(int g, size_t *len, uint64_t *newestStartUs) {
     const HtpGroupQueue &q = s_htpQ[g];
     uint32_t first = q.meta[q.head].seq;
     uint8_t n = 0;
@@ -636,6 +648,7 @@ static uint8_t htpBuildPost(int g, size_t *len) {
         if (q.meta[slot].seq != first + n) break;
         memcpy(s_htpPost + off, q.bytes + (size_t)slot * q.windowBytes, q.windowBytes);
         off += q.windowBytes;
+        *newestStartUs = q.meta[slot].tStartUs;
         n++;
     }
     htpWriteHeader(s_htpPost, s_htpSession, HTP_CHANNEL_SET_ID, kHtpGroups[g].key, n, first,
@@ -754,15 +767,20 @@ static void htpNoteFailure() {
 static void htpSendNext() {
     if (!s_htpConfigOk || !networkBearerUp()) return;
     if ((int32_t)(millis() - s_htpNextSendMs) < 0) return;
+    xSemaphoreTake(s_htpLock, portMAX_DELAY);
     int g = htpOldestGroup();
-    if (g < 0) return;
-
+    if (g < 0) {
+        xSemaphoreGive(s_htpLock);
+        return;
+    }
     HtpGroupQueue &q = s_htpQ[g];
     size_t len = 0;
-    uint8_t n = htpBuildPost(g, &len);
+    uint64_t newestStartUs = 0;
     uint32_t first = q.meta[q.head].seq;
+    uint8_t n = htpBuildPost(g, &len, &newestStartUs);
+    xSemaphoreGive(s_htpLock);
     // End of the newest window in this POST: what the dashboard would show.
-    int64_t newestEndMs = (int64_t)(q.meta[htpSlot(q, n - 1)].tStartUs / 1000ULL) + 1000;
+    int64_t newestEndMs = (int64_t)(newestStartUs / 1000ULL) + 1000;
 
     String response;
     uint32_t t0 = millis();
@@ -775,7 +793,7 @@ static void htpSendNext() {
         int32_t serverMs = 0;
         int listed = ackedCount(response, first, n, &serverMs);
         if (listed == n) {
-            htpDequeue(q, n);
+            htpDequeueRange(q, first, n);
             s_htpStats.postsOk++;
             s_htpStats.windowsAcked += n;
             if (s_htpLastReused) s_htpStats.reused++;
@@ -800,7 +818,7 @@ static void htpSendNext() {
         Serial.printf("[htp] HTTP 200 acked %d of %u windows from seq=%lu; dropping them "
                       "(permanent=%lu)\n",
                       listed, n, (unsigned long)first, (unsigned long)s_htpPermanentErrors);
-        htpDequeue(q, n);
+        htpDequeueRange(q, first, n);
         s_htpNextSendMs = 0;
         return;
     }
@@ -824,7 +842,7 @@ static void htpSendNext() {
     if (response.length() > 0) {
         Serial.println(response.substring(0, 160));
     }
-    htpDequeue(q, n);
+    htpDequeueRange(q, first, n);
     s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
     s_htpNextSendMs = 0;
 }
@@ -852,81 +870,37 @@ static void htpLogStats() {
     s_htpStatsStartMs = now;
 }
 
-// Synthetic samples for one completed second. The whole window is generated at
-// once after the second ends: its timestamps say when the samples would have
-// been taken, not when anything was measured.
-static void htpEmitWindow(int64_t winSec) {
-    uint64_t tStartUs = (uint64_t)winSec * 1000000ULL;
-    float relS = (float)(winSec - s_htpFirstWindowSec);
-    float samples[22 * 10];
+void netTaskPushWindow(int group, uint64_t tStartUs, const float *samples) {
+    if (!s_htpConfigOk || group < 0 || group >= HTP_GROUP_COUNT) return;
+    // A window is identified by its start second, so a reboot into the same
+    // session never reuses a seq.
+    uint32_t seq = (uint32_t)(tStartUs / 1000000ULL);
     uint8_t frame[HTP_MAX_FRAME_BYTES];
-    for (int g = 0; g < HTP_GROUP_COUNT; g++) {
-        const HtpGroup *group = &kHtpGroups[g];
-        if ((size_t)group->channel_count * group->rate_hz > sizeof(samples) / sizeof(samples[0])) {
-            Serial.printf("[htp] group %u does not fit the sample buffer\n", group->key);
-            continue;
-        }
-        size_t n = 0;
-        for (uint8_t c = 0; c < group->channel_count; c++) {
-            for (uint16_t i = 0; i < group->rate_hz; i++) {
-                float t = relS + (float)i / (float)group->rate_hz;
-                samples[n++] = htpSynth(group->channels[c].id, t);
-            }
-        }
-        uint32_t seq = (uint32_t)winSec;
-        // send_timestamp_ms is rewritten by htpBuildPost().
-        size_t len = htpEncodeFrame(frame, sizeof(frame), s_htpSession, HTP_CHANNEL_SET_ID,
-                                    group, seq, 0, 1, &tStartUs, samples);
-        if (len == 0) {
-            Serial.printf("[htp] encode failed group=%u seq=%lu\n", group->key, (unsigned long)seq);
-            continue;
-        }
-        htpEnqueue(g, seq, tStartUs, frame, len);
+    // send_timestamp_ms is rewritten by htpBuildPost().
+    size_t len = htpEncodeFrame(frame, sizeof(frame), s_htpSession, HTP_CHANNEL_SET_ID,
+                                &kHtpGroups[group], seq, 0, 1, &tStartUs, samples);
+    if (len == 0) {
+        Serial.printf("[htp] encode failed group=%u seq=%lu\n", kHtpGroups[group].key,
+                      (unsigned long)seq);
+        return;
     }
-}
-
-static void htpEmitWindows() {
-#if !HTP_SYNTH_MODE
-    return;
-#else
-    if (!g_timeSync.isSynced()) return;
-    int64_t done = htpNowMs() / 1000 - 1; // newest completed second
-    if (s_htpLastWindowSec < 0) {
-        s_htpFirstWindowSec = done;
-        s_htpLastWindowSec = done - 1;
-    }
-    // A slow POST blocks this task for several seconds. Emit every second it
-    // covered (bounded by the queue) so the backlog is real, not skipped.
-    if (done - s_htpLastWindowSec > HTP_RETRY_QUEUE_MAX) {
-        s_htpLastWindowSec = done - HTP_RETRY_QUEUE_MAX;
-    }
-    while (s_htpLastWindowSec < done) {
-        htpEmitWindow(++s_htpLastWindowSec);
-    }
-#endif
+    xSemaphoreTake(s_htpLock, portMAX_DELAY);
+    htpEnqueue(group, seq, tStartUs, frame, len);
+    xSemaphoreGive(s_htpLock);
 }
 
 static void htpMaintain() {
     htpLogConfigOnce();
     if (!s_htpConfigOk) return;
-#if !(HTP_SYNTH_MODE)
-    static bool warned = false;
-    if (!warned) {
-        warned = true;
-        Serial.println("[htp] HTP_SYNTH_MODE=0; CAN is not mapped onto channel set 1, so nothing is posted");
-    }
-    return;
-#endif
     if (!g_timeSync.isSynced()) {
         static uint32_t last = 0;
         if (millis() - last > 5000) {
             last = millis();
-            Serial.println("[htp] waiting for SNTP before the first window");
+            Serial.println("[htp] waiting for SNTP; the sampler starts with the clock");
         }
         return;
     }
     if (s_htpStatsStartMs == 0) s_htpStatsStartMs = millis();
-    htpEmitWindows();
     htpSendNext();
     htpLogStats();
     if (s_htpDroppedOldest && (s_htpDroppedOldest % 10) == 0) {
@@ -941,8 +915,6 @@ static void htpMaintain() {
 
 // ---- Task ------------------------------------------------------------
 static void netTask(void *) {
-    s_htpSessionOk = htpParseUuid(HTP_SESSION_ID, s_htpSession);
-    s_htpConfigOk = htpConfigReady() && htpQueuesInit();
     htpLogConfigOnce();
 
 #if !TELEMETRY_USE_WIFI
@@ -1020,6 +992,11 @@ static void netTask(void *) {
 }
 
 void netTaskStart() {
+    // Before the task (and the sampler) start, so netTaskPushWindow never sees
+    // a half-built queue.
+    s_htpLock = xSemaphoreCreateMutex();
+    s_htpSessionOk = htpParseUuid(HTP_SESSION_ID, s_htpSession);
+    s_htpConfigOk = s_htpLock && htpConfigReady() && htpQueuesInit();
     // TLS handshakes run in mbedTLS on this task's stack. HTTPClient adds another
     // buffer on top of the handshake, so this is larger than the MQTT task was.
     xTaskCreatePinnedToCore(netTask, "net_task", 24576, nullptr, tskIDLE_PRIORITY + 2,
