@@ -55,6 +55,12 @@ format from that point inward (staging, compaction, parquet, web reads).
 - **seq** (u32) numbers windows per `(session, group)`, starting at 0,
   incrementing by 1 per window with no gaps. The (session_id, group_key, seq)
   triple is the idempotency key - retries are safe.
+  - Firmware note (2026-10-29): the ESP32 sets `seq` to the window's unix
+    second instead of counting from 0. Its session id is fixed per flash and
+    its counter would restart at 0 on every reboot, so new windows would hit
+    stored seqs and be dropped as `dup`. The server only needs seqs to be
+    unique per `(session, group)` and consecutive within a frame; a gap now
+    means a second with no window.
 
 ## 3. Frame layout
 

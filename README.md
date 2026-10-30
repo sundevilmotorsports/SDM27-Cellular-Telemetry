@@ -243,7 +243,8 @@ Edit `include/telemetry_config.h`:
 | `HTP_SESSION_ID` | UUID of an existing `telemetry.sessions` row. A UUID that is not a row is rejected. |
 | `HTP_CHANNEL_SET_ID` | Must be `1` (`SDM26-cell-v1`) until another set is frozen. |
 | `HTP_SYNTH_MODE` | `1` (default) = synth every channel in set 1 and do not start CAN. Real CAN mapping is not wired. |
-| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES`, `BATCH_MAX_JSON_BYTES` | Left over from the JSON CAN path. The HTP uplink does not use them. It sends one 1-second window per POST and keeps 32 windows in RAM. |
+| `HTP_POST_MAX_WINDOWS` | Windows per POST, 1..8 (default 8). Each group keeps up to `HTP_RETRY_QUEUE_MAX` (32) one-second windows in RAM; a POST sends as many consecutive ones of a group as are queued, up to this. |
+| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES`, `BATCH_MAX_JSON_BYTES` | Left over from the JSON CAN path. The HTP uplink does not use them. |
 | `TELEMETRY_STRESS_TEST` | Leave `0`. The old MQTT filler burst is not POSTed to the ingest URL. |
 | `MODEM_USB_BENCH_MODE` | `1` = power the modem on and stop -- no registration/MQTT/stress test, UART1 stays silent so a PC can drive the modem directly over its own USB port (see [USB direct-to-modem bench](#usb-direct-to-modem-bench-bypassing-the-esp32-modem-uart)); `0` = normal operation (default). Cellular only. |
 | `SMS_TEST_ENABLED` | `1` = send one test SMS after the modem registers on the network, to `SMS_TEST_NUMBER` (see `include/sms_config.h`); `0` = off (default). Cellular only -- build error under `TELEMETRY_USE_WIFI=1` |
@@ -296,6 +297,62 @@ involved.
    (`192.168.4.2:9001`) or point them at your own broker's WebSocket
    listener, and click Connect. Renders each batch's `frames[]` as a live
    table plus running batch/seq/dropped-frame counters.
+
+## Supabase uplink (HTP/1)
+
+The board POSTs binary HTP/1 to the `telemetry-ingest` edge function
+(`docs/wire-protocol.md`). The function stages every window in
+`telemetry.staging_chunks` and broadcasts the latest sample of each POST on
+Realtime topic `telemetry:live:{session_id}`. The dashboard side of that
+broadcast is in [`docs/live-dashboard.md`](docs/live-dashboard.md).
+
+**Status (2026-10-29):** the uplink sends synthetic samples for channel set 1
+(`HTP_SYNTH_MODE=1`). CAN is not mapped onto the channels yet, so real
+vehicle data does not reach Supabase. The host tools below were run against
+the team project; the board itself has not posted over LTE with this
+firmware yet.
+
+How the board sends:
+
+- Once per second, one window per group for the second that just ended
+  (3 groups). `seq` is that second's unix time, so a reboot with the same
+  `HTP_SESSION_ID` never collides with data already stored (the server would
+  ack a reused seq as `dup` and keep the old window).
+- POSTs go one at a time, oldest queued window first. If the uplink falls
+  behind, a POST carries up to `HTP_POST_MAX_WINDOWS` consecutive windows of
+  one group, so the request rate drops while it catches up.
+- A kept-alive TLS socket that the server has closed is retried once on a
+  new connection before backing off.
+
+What it prints (lines from the host test below, with a fake 300 ms server,
+not from the board):
+
+```
+[htp] g0 seq=1793320172+2 (932 B) 200 in 300 ms (server 42 ms, reused) age=1150 ms queued=0/0/0
+[htp] stats 10s: posts 29 ok/0 failed, 31 windows (3.1/s), req avg 300 max 300 ms, busy 86%, reused 29/29, queued 1/1/0, oldest 300 ms, dropped 57, rejected 1
+```
+
+`age` is how old the newest sample in the POST was when the ack came back
+(about what the dashboard sees). `busy` is the share of time spent inside
+POSTs: near 100% the queues grow and `oldest` climbs. `reused` counts
+requests that skipped the TLS handshake.
+
+Host checks (no board needed). The first runs the queue logic of
+`net_task.cpp` against a fake server and clock (batching, retries, drops,
+stale socket); the rest read `.env` and talk to the real project:
+
+```sh
+sh tools/htp_uplink_host/run.sh
+c++ -std=c++17 -O2 -Iinclude tools/htp_emit_sample.cpp src/htp_frame.cpp -o tools/htp_emit_sample
+.venv/bin/python scripts/post_synth_htp.py                 # one second, 3 POSTs
+.venv/bin/python scripts/post_synth_htp.py --windows 8     # one 8-window frame per group
+.venv/bin/python scripts/post_synth_htp.py --seconds 30    # 1 Hz like the board
+.venv/bin/python scripts/watch_live.py --seconds 40        # subscribe like a browser
+```
+
+`watch_live.py` uses the publishable key (`HTTPS_API_KEY` in `.env`) and
+prints each broadcast's arrival interval and age per group, flagging any
+that arrive older than one already shown.
 
 ## Demonstration checklist (real CAN hardware)
 
