@@ -59,7 +59,7 @@ today.
 | `seq` | seq of the last window in the POST. Per `(session, group)`. The firmware uses the window's unix second, so it also tells you which second the values are from. |
 | `t_us` | unix microseconds of the sample in `values`: `t_start + (rate_hz - 1) / rate_hz` s. 10 Hz groups: window start + 0.9 s. 1 Hz group: window start. |
 | `send_timestamp_ms` | board's clock when the POST was attempted. Only for latency measurement. |
-| `values` | channel id -> value, in the channel's units (below), already scaled. A dropout (i16fp null sentinel) arrives as `null` once the 2026-10-29 `frame.ts` fix is deployed; before it, the function decoded a dropout as `-32768 * scale + offset` (e.g. -16384 rpm). The synth never sends dropouts. |
+| `values` | channel id -> value, in the channel's units (below), already scaled. See "Dropouts" below. |
 
 There is **no group key** in the payload. Each message contains exactly the
 channels of one group, so the group is the group of any key in `values`
@@ -84,7 +84,34 @@ channels of one group, so the group is the group of any key in `values`
    them as JS numbers.
 5. **Session.** `session_id` is fixed per flash (`HTP_SESSION_ID`) and must be
    a row in `telemetry.sessions`. The dashboard needs it up front to pick the
-   topic.
+   topic. See "Sessions" below for who creates it.
+6. **Dropouts.** When the board has no value for an i16fp sample it sends
+   raw `-32768`, which `wire-protocol.md` 3.3 says means null. The ingest
+   function (as deployed, and as in the Helios dev kit, whose `frame_test.ts`
+   asserts it) decodes it like any other raw value: `-32768 * scale + offset`.
+   So a dropout shows up as that exact number per channel, e.g. -16384 for
+   `engine.rpm`, -327.68 for `engine.water_temp`, -32.768 for `imu.lat_g`.
+   Treat a value equal to `-32768 * scale + offset` (table below) as missing.
+   The same value is what lands in staging. f32 channels have no sentinel.
+   The synth never sends dropouts; real CAN data will once it is mapped.
+   Values outside the i16fp range are clamped to `+-32767 * scale + offset`,
+   e.g. `engine.rpm` tops out at 16383.5.
+
+## Sessions
+
+- A session is a row in `telemetry.sessions`. Postgres fills `id` with
+  `gen_random_uuid()` when the row is inserted, so the UUID is generated
+  server-side, but something has to insert the row: a service-role call.
+- Today that is `npm run session` in the Helios telemetry dev kit (a
+  placeholder). Its `CONTEXT.md` (2026-10-17) says the pit-side session tool
+  and the Helios live UI do not exist yet, and how the car learns the id is
+  undecided. Nothing in Helios creates sessions automatically yet.
+- The ingest function never creates one. A frame for an id that is not a row
+  fails with HTTP 500 (`staging_chunks_session_id_fkey`), checked against
+  the team project 2026-10-29. The board keeps retrying it with backoff, so
+  creating the row afterwards recovers the queued data (up to 32 s of it).
+- For now the id is flashed into the board (`HTP_SESSION_ID` in `.env`), so
+  one session spans every boot until it is changed and reflashed.
 
 ## Channel set 1 (`SDM26-cell-v1`)
 

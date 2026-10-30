@@ -240,7 +240,7 @@ Edit `include/telemetry_config.h`:
 | `HTTPS_INGEST_URL` | Edge function URL: `https://<project-ref>.supabase.co/functions/v1/telemetry-ingest`. Not `/rest/v1/`. Put it in `.env`, then reflash. |
 | `TELEMETRY_HMAC_KEY` | Device HMAC key. Sent only as `x-htp-signature` over the raw body. Same value as the function's `TELEMETRY_HMAC_KEY`. Never a Supabase secret. Put it in `.env`. |
 | `HTP_DEVICE_ID` | `x-htp-device` header. |
-| `HTP_SESSION_ID` | UUID of an existing `telemetry.sessions` row. A UUID that is not a row is rejected. |
+| `HTP_SESSION_ID` | UUID of an existing `telemetry.sessions` row. The row is created out of band with the service role (the Helios dev kit's `npm run session`; Postgres generates the UUID); the ingest function never creates one. An id that is not a row gets HTTP 500 on every POST. See `docs/live-dashboard.md` "Sessions". |
 | `HTP_CHANNEL_SET_ID` | Must be `1` (`SDM26-cell-v1`) until another set is frozen. |
 | `HTP_SYNTH_MODE` | `1` (default) = synth every channel in set 1 and do not start CAN. Real CAN mapping is not wired. |
 | `HTP_POST_MAX_WINDOWS` | Windows per POST, 1..8 (default 8). Each group keeps up to `HTP_RETRY_QUEUE_MAX` (32) one-second windows in RAM; a POST sends as many consecutive ones of a group as are queued, up to this. |
