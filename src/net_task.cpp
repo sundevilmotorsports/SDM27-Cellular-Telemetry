@@ -8,6 +8,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <esp_heap_caps.h>
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <mbedtls/md.h>
@@ -480,26 +481,50 @@ static void restartStalePpp() {
 #endif
 
 // ---- HTP/1 POST ------------------------------------------------------------
-// One encoded window per frame. The in-RAM queue is the retry protocol.
+// One RAM ring of encoded windows per group; the rings are the retry protocol.
+// seq is the window's unix second, so a reboot under the same HTP_SESSION_ID
+// never reuses a seq (the server would ack it as a dup and keep the old data).
+// Each POST takes up to HTP_POST_MAX_WINDOWS consecutive windows from the group
+// whose oldest window is oldest, so a backlog drains in fewer requests.
 // Old LittleFS JSON batches are not replayed: they are not HTP and would 400.
 
-struct HtpQueuedFrame {
-    uint8_t groupKey;
+static_assert(HTP_POST_MAX_WINDOWS >= 1 && HTP_POST_MAX_WINDOWS <= HTP_MAX_WINDOWS,
+              "HTP_POST_MAX_WINDOWS must be 1..8");
+
+struct HtpQueuedWindow {
     uint32_t seq;
-    uint16_t len;
-    uint8_t body[HTP_MAX_FRAME_BYTES];
+    uint64_t tStartUs;
 };
 
-static HtpQueuedFrame s_htpQueue[HTP_RETRY_QUEUE_MAX];
-static int s_htpHead = 0;
-static int s_htpCount = 0;
-static uint32_t s_htpSeq[HTP_GROUP_COUNT] = {};
+struct HtpGroupQueue {
+    HtpQueuedWindow meta[HTP_RETRY_QUEUE_MAX];
+    uint8_t *bytes;     // window sections only (no header), windowBytes each
+    size_t windowBytes;
+    int head;
+    int count;
+};
+
+// Reset every HTP_STATS_INTERVAL_MS by htpLogStats().
+struct HtpStats {
+    uint32_t postsOk;
+    uint32_t postsFailed;
+    uint32_t windowsAcked;
+    uint32_t reqMsSum;
+    uint32_t reqMsMax;
+    uint32_t reused;
+};
+
+static HtpGroupQueue s_htpQ[HTP_GROUP_COUNT];
+static uint8_t s_htpPost[HTP_MAX_POST_BYTES];
+static HtpStats s_htpStats = {};
+static uint32_t s_htpStatsStartMs = 0;
 static uint32_t s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
 static uint32_t s_htpNextSendMs = 0;
 static uint32_t s_htpDroppedOldest = 0;
 static uint32_t s_htpPermanentErrors = 0;
 static int64_t s_htpLastWindowSec = -1;
-static float s_htpRelS = 0.0f;
+static int64_t s_htpFirstWindowSec = -1;
+static bool s_htpLastReused = false;
 static uint8_t s_htpSession[16];
 static bool s_htpSessionOk = false;
 static bool s_htpConfigOk = false;
@@ -534,32 +559,89 @@ static void htpLogConfigOnce() {
                   HTP_DEVICE_ID, HTP_SESSION_ID, (unsigned)HTP_CHANNEL_SET_ID);
 }
 
-static int htpQueueIndex(int offset) {
-    return (s_htpHead + offset) % HTP_RETRY_QUEUE_MAX;
+static bool htpQueuesInit() {
+    for (int g = 0; g < HTP_GROUP_COUNT; g++) {
+        HtpGroupQueue &q = s_htpQ[g];
+        q.windowBytes = htpWindowBytes(&kHtpGroups[g]);
+        size_t n = q.windowBytes * HTP_RETRY_QUEUE_MAX;
+        q.bytes = psramFound() ? (uint8_t *)heap_caps_malloc(n, MALLOC_CAP_SPIRAM) : nullptr;
+        if (!q.bytes) q.bytes = (uint8_t *)malloc(n);
+        if (!q.bytes) {
+            Serial.printf("[htp] no memory for the group %u queue (%u bytes)\n",
+                          kHtpGroups[g].key, (unsigned)n);
+            return false;
+        }
+    }
+    return true;
 }
 
-static void htpDropOldest() {
-    if (s_htpCount == 0) return;
-    s_htpHead = (s_htpHead + 1) % HTP_RETRY_QUEUE_MAX;
-    s_htpCount--;
-    s_htpDroppedOldest++;
+static int htpSlot(const HtpGroupQueue &q, int offset) {
+    return (q.head + offset) % HTP_RETRY_QUEUE_MAX;
 }
 
-static void htpEnqueue(uint8_t groupKey, uint32_t seq, const uint8_t *body, size_t len) {
-    if (len == 0 || len > HTP_MAX_FRAME_BYTES) return;
-    if (s_htpCount == HTP_RETRY_QUEUE_MAX) htpDropOldest();
-    HtpQueuedFrame &slot = s_htpQueue[htpQueueIndex(s_htpCount)];
-    slot.groupKey = groupKey;
-    slot.seq = seq;
-    slot.len = (uint16_t)len;
-    memcpy(slot.body, body, len);
-    s_htpCount++;
+static void htpDequeue(HtpGroupQueue &q, int n) {
+    n = std::min(n, q.count);
+    q.head = htpSlot(q, n);
+    q.count -= n;
 }
 
-static void htpDequeueHead() {
-    if (s_htpCount == 0) return;
-    s_htpHead = (s_htpHead + 1) % HTP_RETRY_QUEUE_MAX;
-    s_htpCount--;
+static void htpEnqueue(int g, uint32_t seq, uint64_t tStartUs, const uint8_t *frame, size_t len) {
+    HtpGroupQueue &q = s_htpQ[g];
+    if (!q.bytes || len != HTP_HEADER_BYTES + q.windowBytes) return;
+    if (q.count == HTP_RETRY_QUEUE_MAX) {
+        htpDequeue(q, 1);
+        s_htpDroppedOldest++;
+    }
+    int slot = htpSlot(q, q.count);
+    q.meta[slot] = {seq, tStartUs};
+    memcpy(q.bytes + (size_t)slot * q.windowBytes, frame + HTP_HEADER_BYTES, q.windowBytes);
+    q.count++;
+}
+
+// Group with the oldest queued window, or -1 when every queue is empty.
+static int htpOldestGroup() {
+    int best = -1;
+    for (int g = 0; g < HTP_GROUP_COUNT; g++) {
+        const HtpGroupQueue &q = s_htpQ[g];
+        if (q.count == 0) continue;
+        if (best < 0 || q.meta[q.head].tStartUs < s_htpQ[best].meta[s_htpQ[best].head].tStartUs) {
+            best = g;
+        }
+    }
+    return best;
+}
+
+static int64_t htpNowMs() {
+    return g_timeSync.epochMsFor(esp_timer_get_time());
+}
+
+// Age of the oldest queued window's last sample, in ms. 0 when nothing is queued.
+static int64_t htpOldestAgeMs() {
+    int g = htpOldestGroup();
+    if (g < 0) return 0;
+    const HtpGroupQueue &q = s_htpQ[g];
+    return htpNowMs() - (int64_t)(q.meta[q.head].tStartUs / 1000ULL) - 1000;
+}
+
+// Copies consecutive seqs from the head of group g into s_htpPost under one
+// header. send_timestamp_ms is the time of this attempt, not of encoding, so a
+// retried frame does not report its queue wait as network latency.
+static uint8_t htpBuildPost(int g, size_t *len) {
+    const HtpGroupQueue &q = s_htpQ[g];
+    uint32_t first = q.meta[q.head].seq;
+    uint8_t n = 0;
+    size_t off = HTP_HEADER_BYTES;
+    while (n < q.count && n < HTP_POST_MAX_WINDOWS) {
+        int slot = htpSlot(q, n);
+        if (q.meta[slot].seq != first + n) break;
+        memcpy(s_htpPost + off, q.bytes + (size_t)slot * q.windowBytes, q.windowBytes);
+        off += q.windowBytes;
+        n++;
+    }
+    htpWriteHeader(s_htpPost, s_htpSession, HTP_CHANNEL_SET_ID, kHtpGroups[g].key, n, first,
+                   (uint64_t)htpNowMs());
+    *len = off;
+    return n;
 }
 
 #if TELEMETRY_USE_WIFI && WIFI_AP_MODE
@@ -589,13 +671,7 @@ static void hmacHex(const uint8_t *body, size_t len, char out[65]) {
     out[64] = '\0';
 }
 
-static int httpPostHtp(const uint8_t *body, size_t len, String &response) {
-    response = "";
-    if (!networkBearerUp() || !s_htpConfigOk) return 0;
-    char sig[65];
-    hmacHex(body, len, sig);
-    if (sig[0] == '\0') return 0;
-
+static int httpPostOnce(const uint8_t *body, size_t len, const char *sig, String &response) {
     HTTPClient http;
     if (!http.begin(netClient, HTTPS_INGEST_URL)) return 0;
     http.setConnectTimeout(HTTPS_POST_TIMEOUT_MS);
@@ -605,7 +681,28 @@ static int httpPostHtp(const uint8_t *body, size_t len, String &response) {
     http.addHeader("x-htp-signature", sig);
     int code = http.POST(const_cast<uint8_t *>(body), len);
     response = http.getString();
+    // Leaves the TLS socket open in netClient when the server allows keep-alive.
     http.end();
+    return code;
+}
+
+static int httpPostHtp(const uint8_t *body, size_t len, String &response) {
+    response = "";
+    if (!networkBearerUp() || !s_htpConfigOk) return 0;
+    char sig[65];
+    hmacHex(body, len, sig);
+    if (sig[0] == '\0') return 0;
+
+    // A kept-alive socket the server has since closed still reads as connected
+    // until the first write fails. Retry once on a fresh connection instead of
+    // waiting out a backoff; a duplicate delivery is deduped by seq.
+    s_htpLastReused = netClient.connected();
+    int code = httpPostOnce(body, len, sig, response);
+    if (code < 0 && s_htpLastReused) {
+        netClient.stop();
+        s_htpLastReused = false;
+        code = httpPostOnce(body, len, sig, response);
+    }
 #if !TELEMETRY_USE_WIFI
     if (code >= 0) {
         s_postFailStreak = 0;
@@ -618,17 +715,21 @@ static int httpPostHtp(const uint8_t *body, size_t len, String &response) {
 }
 #endif
 
-// 1 = seq is in acked or dup. 0 = parsed, seq absent. -1 = not JSON.
-static int ackListsSeq(const String &body, uint32_t seq) {
+// How many seqs of [first, first+n) the ack lists in acked or dup; -1 = not JSON.
+// serverMs is the function's own processing time (server_send - server_recv).
+static int ackedCount(const String &body, uint32_t first, uint8_t n, int32_t *serverMs) {
     JsonDocument doc;
     if (deserializeJson(doc, body) != DeserializationError::Ok) return -1;
+    uint32_t seen = 0;
     for (const char *key : {"acked", "dup"}) {
         JsonArray arr = doc[key].as<JsonArray>();
         for (JsonVariant v : arr) {
-            if (v.as<uint32_t>() == seq) return 1;
+            uint32_t d = v.as<uint32_t>() - first;
+            if (d < n) seen |= 1u << d;
         }
     }
-    return 0;
+    *serverMs = (int32_t)(doc["server_send_ms"].as<int64_t>() - doc["server_recv_ms"].as<int64_t>());
+    return __builtin_popcount(seen);
 }
 
 static bool htpRetryable(int code) {
@@ -650,65 +751,107 @@ static void htpNoteFailure() {
     Serial.printf("[htp] retry in %lu ms\n", (unsigned long)wait);
 }
 
-static void htpSendHead() {
-    if (s_htpCount == 0 || !s_htpConfigOk || !networkBearerUp()) return;
+static void htpSendNext() {
+    if (!s_htpConfigOk || !networkBearerUp()) return;
     if ((int32_t)(millis() - s_htpNextSendMs) < 0) return;
+    int g = htpOldestGroup();
+    if (g < 0) return;
 
-    const HtpQueuedFrame &head = s_htpQueue[s_htpHead];
+    HtpGroupQueue &q = s_htpQ[g];
+    size_t len = 0;
+    uint8_t n = htpBuildPost(g, &len);
+    uint32_t first = q.meta[q.head].seq;
+    // End of the newest window in this POST: what the dashboard would show.
+    int64_t newestEndMs = (int64_t)(q.meta[htpSlot(q, n - 1)].tStartUs / 1000ULL) + 1000;
+
     String response;
-    int code = httpPostHtp(head.body, head.len, response);
+    uint32_t t0 = millis();
+    int code = httpPostHtp(s_htpPost, len, response);
+    uint32_t reqMs = millis() - t0;
+    s_htpStats.reqMsSum += reqMs;
+    s_htpStats.reqMsMax = std::max(s_htpStats.reqMsMax, reqMs);
+
     if (code == 200) {
-        int listed = ackListsSeq(response, head.seq);
-        if (listed == 1) {
-            Serial.printf("[htp] acked group=%u seq=%lu HTTP 200 (%u bytes)\n",
-                          head.groupKey, (unsigned long)head.seq, (unsigned)head.len);
-            htpDequeueHead();
+        int32_t serverMs = 0;
+        int listed = ackedCount(response, first, n, &serverMs);
+        if (listed == n) {
+            htpDequeue(q, n);
+            s_htpStats.postsOk++;
+            s_htpStats.windowsAcked += n;
+            if (s_htpLastReused) s_htpStats.reused++;
+            // age = how old the newest sample in this POST was when its ack came back.
+            Serial.printf("[htp] g%u seq=%lu+%u (%u B) 200 in %lu ms (server %ld ms, %s) "
+                          "age=%lld ms queued=%d/%d/%d\n",
+                          kHtpGroups[g].key, (unsigned long)first, n, (unsigned)len,
+                          (unsigned long)reqMs, (long)serverMs, s_htpLastReused ? "reused" : "new conn",
+                          (long long)(htpNowMs() - newestEndMs),
+                          s_htpQ[0].count, s_htpQ[1].count, s_htpQ[2].count);
             s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
             s_htpNextSendMs = 0;
             return;
         }
+        s_htpStats.postsFailed++;
         if (listed < 0) {
             Serial.println("[htp] HTTP 200 but ack was not JSON; will retry the same frame");
             htpNoteFailure();
             return;
         }
-        s_htpPermanentErrors++;
-        Serial.printf("[htp] HTTP 200 did not ack seq=%lu; dropping frame (permanent=%lu)\n",
-                      (unsigned long)head.seq, (unsigned long)s_htpPermanentErrors);
-        htpDequeueHead();
+        s_htpPermanentErrors += n;
+        Serial.printf("[htp] HTTP 200 acked %d of %u windows from seq=%lu; dropping them "
+                      "(permanent=%lu)\n",
+                      listed, n, (unsigned long)first, (unsigned long)s_htpPermanentErrors);
+        htpDequeue(q, n);
         s_htpNextSendMs = 0;
         return;
     }
+    s_htpStats.postsFailed++;
     if (htpRetryable(code)) {
-        Serial.printf("[htp] POST failed HTTP %d, resending group=%u seq=%lu\n",
-                      code, head.groupKey, (unsigned long)head.seq);
+        Serial.printf("[htp] POST failed HTTP %d after %lu ms, resending g%u seq=%lu+%u\n",
+                      code, (unsigned long)reqMs, kHtpGroups[g].key, (unsigned long)first, n);
         htpNoteFailure();
         return;
     }
-    s_htpPermanentErrors++;
-    Serial.printf("[htp] POST rejected HTTP %d, dropping group=%u seq=%lu (permanent=%lu)\n",
-                  code, head.groupKey, (unsigned long)head.seq,
+    s_htpPermanentErrors += n;
+    Serial.printf("[htp] POST rejected HTTP %d, dropping g%u seq=%lu+%u (permanent=%lu)\n",
+                  code, kHtpGroups[g].key, (unsigned long)first, n,
                   (unsigned long)s_htpPermanentErrors);
     if (response.length() > 0) {
         Serial.println(response.substring(0, 160));
     }
-    htpDequeueHead();
+    htpDequeue(q, n);
     s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
     s_htpNextSendMs = 0;
 }
 
-static void htpEmitWindows() {
-#if !HTP_SYNTH_MODE
-    return;
-#else
-    if (!g_timeSync.isSynced()) return;
-    int64_t nowMs = g_timeSync.epochMsFor(esp_timer_get_time());
-    int64_t sec = nowMs / 1000;
-    if (sec == s_htpLastWindowSec) return;
-    s_htpLastWindowSec = sec;
-    uint64_t tStartUs = (uint64_t)sec * 1000000ULL;
-    uint64_t sendMs = (uint64_t)nowMs;
+// busy = share of the interval spent inside POSTs. Near 100% the uplink cannot
+// keep up and queued/oldest grow; that is the number to watch before tuning.
+static void htpLogStats() {
+    uint32_t now = millis();
+    uint32_t span = now - s_htpStatsStartMs;
+    if (span < HTP_STATS_INTERVAL_MS) return;
+    const HtpStats &s = s_htpStats;
+    uint32_t posts = s.postsOk + s.postsFailed;
+    Serial.printf("[htp] stats %lus: posts %lu ok/%lu failed, %lu windows (%.1f/s), "
+                  "req avg %lu max %lu ms, busy %lu%%, reused %lu/%lu, queued %d/%d/%d, "
+                  "oldest %lld ms, dropped %lu, rejected %lu\n",
+                  (unsigned long)(span / 1000), (unsigned long)s.postsOk,
+                  (unsigned long)s.postsFailed, (unsigned long)s.windowsAcked,
+                  s.windowsAcked * 1000.0f / span,
+                  (unsigned long)(posts ? s.reqMsSum / posts : 0), (unsigned long)s.reqMsMax,
+                  (unsigned long)(s.reqMsSum * 100ULL / span), (unsigned long)s.reused,
+                  (unsigned long)s.postsOk, s_htpQ[0].count, s_htpQ[1].count, s_htpQ[2].count,
+                  (long long)htpOldestAgeMs(), (unsigned long)s_htpDroppedOldest,
+                  (unsigned long)s_htpPermanentErrors);
+    s_htpStats = {};
+    s_htpStatsStartMs = now;
+}
 
+// Synthetic samples for one completed second. The whole window is generated at
+// once after the second ends: its timestamps say when the samples would have
+// been taken, not when anything was measured.
+static void htpEmitWindow(int64_t winSec) {
+    uint64_t tStartUs = (uint64_t)winSec * 1000000ULL;
+    float relS = (float)(winSec - s_htpFirstWindowSec);
     float samples[22 * 10];
     uint8_t frame[HTP_MAX_FRAME_BYTES];
     for (int g = 0; g < HTP_GROUP_COUNT; g++) {
@@ -720,20 +863,40 @@ static void htpEmitWindows() {
         size_t n = 0;
         for (uint8_t c = 0; c < group->channel_count; c++) {
             for (uint16_t i = 0; i < group->rate_hz; i++) {
-                float t = s_htpRelS + (float)i / (float)group->rate_hz;
+                float t = relS + (float)i / (float)group->rate_hz;
                 samples[n++] = htpSynth(group->channels[c].id, t);
             }
         }
-        uint32_t seq = s_htpSeq[g]++;
+        uint32_t seq = (uint32_t)winSec;
+        // send_timestamp_ms is rewritten by htpBuildPost().
         size_t len = htpEncodeFrame(frame, sizeof(frame), s_htpSession, HTP_CHANNEL_SET_ID,
-                                    group, seq, sendMs, 1, &tStartUs, samples);
+                                    group, seq, 0, 1, &tStartUs, samples);
         if (len == 0) {
             Serial.printf("[htp] encode failed group=%u seq=%lu\n", group->key, (unsigned long)seq);
             continue;
         }
-        htpEnqueue(group->key, seq, frame, len);
+        htpEnqueue(g, seq, tStartUs, frame, len);
     }
-    s_htpRelS += 1.0f;
+}
+
+static void htpEmitWindows() {
+#if !HTP_SYNTH_MODE
+    return;
+#else
+    if (!g_timeSync.isSynced()) return;
+    int64_t done = htpNowMs() / 1000 - 1; // newest completed second
+    if (s_htpLastWindowSec < 0) {
+        s_htpFirstWindowSec = done;
+        s_htpLastWindowSec = done - 1;
+    }
+    // A slow POST blocks this task for several seconds. Emit every second it
+    // covered (bounded by the queue) so the backlog is real, not skipped.
+    if (done - s_htpLastWindowSec > HTP_RETRY_QUEUE_MAX) {
+        s_htpLastWindowSec = done - HTP_RETRY_QUEUE_MAX;
+    }
+    while (s_htpLastWindowSec < done) {
+        htpEmitWindow(++s_htpLastWindowSec);
+    }
 #endif
 }
 
@@ -756,8 +919,10 @@ static void htpMaintain() {
         }
         return;
     }
+    if (s_htpStatsStartMs == 0) s_htpStatsStartMs = millis();
     htpEmitWindows();
-    htpSendHead();
+    htpSendNext();
+    htpLogStats();
     if (s_htpDroppedOldest && (s_htpDroppedOldest % 10) == 0) {
         static uint32_t reported = 0;
         if (reported != s_htpDroppedOldest) {
@@ -771,7 +936,7 @@ static void htpMaintain() {
 // ---- Task ------------------------------------------------------------
 static void netTask(void *) {
     s_htpSessionOk = htpParseUuid(HTP_SESSION_ID, s_htpSession);
-    s_htpConfigOk = htpConfigReady();
+    s_htpConfigOk = htpConfigReady() && htpQueuesInit();
     htpLogConfigOnce();
 
 #if !TELEMETRY_USE_WIFI

@@ -169,7 +169,8 @@
 #define PPP_CONNECT_TIMEOUT_MS 30000
 
 // ---- HTTPS ingest (Helios HTP/1) ---------------------------------------
-// One POST per 1-second window, body is binary HTP/1 for channel set 1.
+// One POST carries 1..HTP_POST_MAX_WINDOWS one-second windows of one group,
+// body is binary HTP/1 for channel set 1.
 // URL is the edge function, not PostgREST:
 //   https://<project-ref>.supabase.co/functions/v1/telemetry-ingest
 // Auth is HMAC-SHA256 of the raw body, sent as x-htp-signature. Do not send
@@ -210,7 +211,17 @@
 #ifndef HTP_SYNTH_MODE
 #define HTP_SYNTH_MODE 1
 #endif
+// Windows kept per group (one per second, so ~32 s of backlog each). Oldest
+// is dropped beyond this.
 #define HTP_RETRY_QUEUE_MAX 32
+// Windows per POST (protocol max 8). A group with a backlog sends up to this
+// many consecutive windows in one request, so a slow uplink makes fewer,
+// larger POSTs instead of falling further behind.
+#ifndef HTP_POST_MAX_WINDOWS
+#define HTP_POST_MAX_WINDOWS 8
+#endif
+// Period of the "[htp] stats" serial line (request time, busy %, queue age).
+#define HTP_STATS_INTERVAL_MS 10000
 #define HTP_BACKOFF_INITIAL_MS 1000
 #define HTP_BACKOFF_MAX_MS 8000
 // How long one POST, including the TLS handshake, may take before it is
