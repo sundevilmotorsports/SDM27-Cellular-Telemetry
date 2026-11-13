@@ -1,5 +1,11 @@
 # Live dashboard contract
 
+> **Legacy (2026-11-12).** The firmware no longer sends HTP/1. It posts raw CAN
+> batches that the dashboard decodes with the logger config; see README.md
+> "Supabase uplink (raw CAN batches)". This page describes the old decoded
+> `telemetry:live:{session_id}` broadcast, which the ingest function still
+> supports for other senders.
+
 What a browser dashboard gets from the current pipeline, and how to merge it.
 Nothing here needs a Supabase change: it describes the broadcast that
 `supabase/functions/telemetry-ingest` already publishes.
