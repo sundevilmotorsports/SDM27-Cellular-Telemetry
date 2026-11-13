@@ -489,8 +489,8 @@ static void restartStalePpp() {
 // One batch is in flight at a time and is kept until the server has it (2xx,
 // including a dup), so a retry carries the same seq and frames. Only sent_ms
 // changes: it is the Unix ms of each attempt, written into the body (fixed
-// 13 digits, in place) and signed just before the POST, so the dashboard can
-// compare it with received_at for uplink latency. Meanwhile
+// 13 digits, in place) and signed just before the POST. The server stores it
+// as sent_at and the dashboard compares it with its own clock. Meanwhile
 // new frames wait in the CAN queue and the next batch takes as many as fit, so
 // a slow or stalled uplink makes fewer, bigger batches instead of a backlog of
 // small ones. When the queue overflows the oldest frames go, and the count

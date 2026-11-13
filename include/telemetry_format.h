@@ -14,8 +14,8 @@
 //   }
 // `ts_ms` is Unix epoch milliseconds at the frame's own capture instant.
 // `sent_ms` is Unix epoch milliseconds when this POST attempt left the board
-// (rewritten on every retry; seq stays the same), for uplink latency against
-// the server's received_at.
+// (rewritten on every retry; seq stays the same). Stored as sent_at; the
+// dashboard compares it with its own clock for latency.
 // `data` is the payload as lowercase hex, `dlc` bytes long. `dlc` is the
 // payload length in bytes (0-8 classic; 0-8, 12, 16, 20, 24, 32, 48, 64 FD),
 // not the 4-bit DLC code from the wire. CAN FD frames add `"fd": true` and

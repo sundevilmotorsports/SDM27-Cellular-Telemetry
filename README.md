@@ -212,11 +212,12 @@ is lowercase hex with no prefix.
 
 `ts_ms` is Unix epoch milliseconds, per frame. `seq` is the batch's build
 time in Unix ms: unique per device even across power cuts (see below).
-`sent_ms` is when the POST left the board, in Unix ms, rewritten (and
-re-signed) on every retry, so `received_at - sent_ms` on the server is the
-uplink latency of that request (both clocks are NTP, so expect tens of ms of
-skew). `telemetry.can_batches` has no column for it yet, so the ingest
-function drops it until a `sent_at` column and the function are updated.
+`sent_ms` is when the POST left the board, in Unix ms (UTC), rewritten
+(and re-signed) on every retry. The ingest function stores it as
+`telemetry.can_batches.sent_at`, the batch's only timestamp (there is no
+server `received_at`); the dashboard takes its own clock minus `sent_at` as
+the board-to-screen latency. Both clocks are NTP, so expect tens of ms of
+skew.
 `dropped_frames` counts frames lost since the previous batch: queue overflow,
 plus the frames of any batch the server rejected. `device_id` must match the
 signed `x-htp-device` header. At most 4096 frames per batch (server limit);
