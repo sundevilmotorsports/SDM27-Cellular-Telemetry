@@ -2,8 +2,8 @@
 //
 // The ESP32-C5's own TWAI-FD controller drives an Adafruit CAN Pal and puts
 // random classic and CAN FD frames on the bus. The main T-SIM7670G-S3 node
-// receives them through its Soldered MCP2518 board and publishes them over
-// MQTT; bench/verify_frames.py then checks every frame that reaches the broker.
+// receives them through its Soldered MCP2518 board and posts them as raw CAN
+// batches. (bench/verify_frames.py checked random frames on the old MQTT path.)
 //
 // Every frame is self-checking, so the receiving end can verify it without
 // any shared state:
@@ -16,9 +16,9 @@
 //                     fd, brs, len (1 byte each), data[0..len-2]
 //
 // ECU mode ('e') instead sends the fixed bench ECU pattern from
-// include/bench_ecu_pattern.h at 10 Hz: real-looking signals (rpm, throttle,
-// brake, g...) that the telemetry node decodes into channel set 1 when built
-// with CAN_MAP_BENCH=1 and HTP_SYNTH_MODE=0.
+// include/bench_ecu_pattern.h at 10 Hz: frames laid out per the car logger's
+// config.json (rpm, coolant, TPS, gear, fuel, IMU), which the dashboard
+// decodes once the telemetry node has posted them.
 //
 // Serial commands (115200): + / - double/halve rate, p pause/resume,
 // b burst 200 frames back-to-back, v toggle per-frame logging,
@@ -167,11 +167,12 @@ static bool sendRandomFrame(uint32_t waitMs) {
     return true;
 }
 
-// One step of the bench ECU pattern: 0x5F0 (classic) and 0x5F1 (FD + BRS).
+// One step of the bench ECU pattern (logger config ids, see bench_ecu_pattern.h).
 static void sendEcuStep() {
-    BenchEcuFrame e[2];
-    benchEcuFrames(s_ecuStep++, e);
-    for (const BenchEcuFrame &f : e) {
+    BenchEcuFrame e[BENCH_ECU_MAX_FRAMES];
+    int n = benchEcuFrames(s_ecuStep++, e);
+    for (int k = 0; k < n; k++) {
+        const BenchEcuFrame &f = e[k];
         TxSlot *slot = takeSlot(0);
         if (!slot) return;
         memcpy(slot->data, f.data, f.len);
