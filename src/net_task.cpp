@@ -2,14 +2,19 @@
 #include "board_pins.h"
 #include "telemetry_config.h"
 #include "sms_config.h"
-#include "telemetry_format.h"
 #include "time_sync.h"
-#include "can_handler.h"
+#include "htp_frame.h"
 
-#include <HTTPClient.h>
-#include <LittleFS.h>
 #include <Arduino.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <esp_heap_caps.h>
+#include <esp_random.h>
+#include <esp_timer.h>
+#include <mbedtls/md.h>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <vector>
 
 #if SMS_TEST_ENABLED && TELEMETRY_USE_WIFI
@@ -38,13 +43,8 @@ static HardwareSerial &SerialAT = Serial1;
 static NetworkClientSecure netClient;
 #endif
 
-static uint32_t s_batchSeq = 0;
 static uint32_t s_lastRegCheckMs = 0;
-static uint32_t s_lastBatchMs = 0;
 static uint32_t s_lastTimeSyncMs = 0;
-static int s_spoolFileCounter = 0;
-static uint32_t s_lastReplayMs = 0;
-static uint32_t s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
 
 #if TELEMETRY_USE_WIFI
 #if WIFI_AP_MODE
@@ -52,8 +52,8 @@ static uint32_t s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
 // The ESP32-S3 hosts its own network instead of joining one. No internet
 // uplink exists in this mode, so NTP time sync is skipped entirely -- only
 // relative (inter-frame) timing stays accurate, per README's Known
-// Limitations. There is also no route to HTTPS_INGEST_URL, so batches are
-// spooled and not POSTed until the board joins a network that can reach it.
+// Limitations. There is also no route to HTTPS_INGEST_URL, so nothing is
+// POSTed in this mode.
 static bool s_apStarted = false;
 
 static void wifiConnectBlocking() {
@@ -63,7 +63,7 @@ static void wifiConnectBlocking() {
     s_apStarted = WiFi.softAP(WIFI_AP_SSID, strlen(WIFI_AP_PASSWORD) ? WIFI_AP_PASSWORD : nullptr);
     if (s_apStarted) {
         Serial.printf("[net] AP up, IP: %s -- no route to the ingest host from here; "
-                      "batches will spool until the board has internet\n",
+                      "nothing is posted in AP mode\n",
                       WiFi.softAPIP().toString().c_str());
     } else {
         Serial.println("[net] failed to start WiFi AP");
@@ -480,41 +480,243 @@ static void restartStalePpp() {
 }
 #endif
 
-// ---- HTTPS POST ---------------------------------------------------------
-// There is no session to maintain. Each batch is one POST; the status line is
-// the ack MQTT QoS 0 never gave. 2xx means stored. 409 means a unique
-// constraint already has this (device_id, seq), which a spool replay will hit
-// if the original POST landed and the response was lost. 400/401/403/404/422
-// will not get better by retrying.
+// ---- HTP/1 POST ------------------------------------------------------------
+// One RAM ring of encoded windows per group; the rings are the retry protocol.
+// seq is the window's unix second, so a reboot under the same HTP_SESSION_ID
+// never reuses a seq (the server would ack it as a dup and keep the old data).
+// Each POST takes up to HTP_POST_MAX_WINDOWS consecutive windows from the group
+// whose oldest window is oldest, so a backlog drains in fewer requests.
+// Old LittleFS JSON batches are not replayed: they are not HTP and would 400.
+
+static_assert(HTP_POST_MAX_WINDOWS >= 1 && HTP_POST_MAX_WINDOWS <= HTP_MAX_WINDOWS,
+              "HTP_POST_MAX_WINDOWS must be 1..8");
+
+struct HtpQueuedWindow {
+    uint32_t seq;
+    uint64_t tStartUs;
+};
+
+struct HtpGroupQueue {
+    HtpQueuedWindow meta[HTP_RETRY_QUEUE_MAX];
+    uint8_t *bytes;     // window sections only (no header), windowBytes each
+    size_t windowBytes;
+    int head;
+    int count;
+};
+
+// Reset every HTP_STATS_INTERVAL_MS by htpLogStats().
+struct HtpStats {
+    uint32_t postsOk;
+    uint32_t postsFailed;
+    uint32_t windowsAcked;
+    uint32_t reqMsSum;
+    uint32_t reqMsMax;
+    uint32_t reused;
+};
+
+static HtpGroupQueue s_htpQ[HTP_GROUP_COUNT];
+static uint8_t s_htpPost[HTP_MAX_POST_BYTES];
+static HtpStats s_htpStats = {};
+static uint32_t s_htpStatsStartMs = 0;
+static uint32_t s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
+static uint32_t s_htpNextSendMs = 0;
+static uint32_t s_htpDroppedOldest = 0;
+static uint32_t s_htpPermanentErrors = 0;
+// The sampler task enqueues, this task builds POSTs and dequeues.
+static SemaphoreHandle_t s_htpLock = nullptr;
+static bool s_htpLastReused = false;
+static uint8_t s_htpSession[16];
+static bool s_htpSessionOk = false;
+static bool s_htpConfigOk = false;
+
+static bool htpConfigReady() {
+    return HTP_CHANNEL_SET_ID == 1 && strlen(HTTPS_INGEST_URL) > 0 &&
+           strlen(TELEMETRY_HMAC_KEY) > 0 && s_htpSessionOk;
+}
+
+static void htpLogConfigOnce() {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    if (!strlen(HTTPS_INGEST_URL) || !strlen(TELEMETRY_HMAC_KEY) || !strlen(HTP_SESSION_ID)) {
+        Serial.println("[htp] HTTPS_INGEST_URL, TELEMETRY_HMAC_KEY, or HTP_SESSION_ID is empty; "
+                       "no posts until .env is set and the board is reflashed");
+        return;
+    }
+    if (!s_htpSessionOk) {
+        Serial.println("[htp] HTP_SESSION_ID is not a UUID; no posts");
+        return;
+    }
+    if (HTP_CHANNEL_SET_ID != 1) {
+        Serial.println("[htp] HTP_CHANNEL_SET_ID must be 1 until another set is frozen; no posts");
+        return;
+    }
+    if (strstr(HTTPS_INGEST_URL, "/rest/") != nullptr) {
+        Serial.println("[htp] URL looks like PostgREST, not telemetry-ingest; posts will be rejected");
+    }
+    Serial.printf("[htp] ingest %s\n", HTTPS_INGEST_URL);
+    Serial.printf("[htp] device=%s session=%s set=%u\n",
+                  HTP_DEVICE_ID, HTP_SESSION_ID, (unsigned)HTP_CHANNEL_SET_ID);
+}
+
+static bool htpQueuesInit() {
+    for (int g = 0; g < HTP_GROUP_COUNT; g++) {
+        HtpGroupQueue &q = s_htpQ[g];
+        q.windowBytes = htpWindowBytes(&kHtpGroups[g]);
+        size_t n = q.windowBytes * HTP_RETRY_QUEUE_MAX;
+        q.bytes = psramFound() ? (uint8_t *)heap_caps_malloc(n, MALLOC_CAP_SPIRAM) : nullptr;
+        if (!q.bytes) q.bytes = (uint8_t *)malloc(n);
+        if (!q.bytes) {
+            Serial.printf("[htp] no memory for the group %u queue (%u bytes)\n",
+                          kHtpGroups[g].key, (unsigned)n);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int htpSlot(const HtpGroupQueue &q, int offset) {
+    return (q.head + offset) % HTP_RETRY_QUEUE_MAX;
+}
+
+static void htpDequeue(HtpGroupQueue &q, int n) {
+    n = std::min(n, q.count);
+    q.head = htpSlot(q, n);
+    q.count -= n;
+}
+
+// Removes the windows a finished POST covered. The sampler may have dropped
+// some of them (queue full) while the POST was in flight, so this matches by
+// seq instead of removing a count from the head.
+static void htpDequeueRange(HtpGroupQueue &q, uint32_t first, uint8_t n) {
+    xSemaphoreTake(s_htpLock, portMAX_DELAY);
+    while (q.count > 0 && q.meta[q.head].seq - first < n) htpDequeue(q, 1);
+    xSemaphoreGive(s_htpLock);
+}
+
+// Caller holds s_htpLock.
+static void htpEnqueue(int g, uint32_t seq, uint64_t tStartUs, const uint8_t *frame, size_t len) {
+    HtpGroupQueue &q = s_htpQ[g];
+    if (!q.bytes || len != HTP_HEADER_BYTES + q.windowBytes) return;
+    if (q.count == HTP_RETRY_QUEUE_MAX) {
+        htpDequeue(q, 1);
+        s_htpDroppedOldest++;
+    }
+    int slot = htpSlot(q, q.count);
+    q.meta[slot] = {seq, tStartUs};
+    memcpy(q.bytes + (size_t)slot * q.windowBytes, frame + HTP_HEADER_BYTES, q.windowBytes);
+    q.count++;
+}
+
+// Group with the oldest queued window, or -1 when every queue is empty.
+static int htpOldestGroup() {
+    int best = -1;
+    for (int g = 0; g < HTP_GROUP_COUNT; g++) {
+        const HtpGroupQueue &q = s_htpQ[g];
+        if (q.count == 0) continue;
+        if (best < 0 || q.meta[q.head].tStartUs < s_htpQ[best].meta[s_htpQ[best].head].tStartUs) {
+            best = g;
+        }
+    }
+    return best;
+}
+
+static int64_t htpNowMs() {
+    return g_timeSync.epochMsFor(esp_timer_get_time());
+}
+
+// Age of the oldest queued window's last sample, in ms. 0 when nothing is queued.
+static int64_t htpOldestAgeMs() {
+    xSemaphoreTake(s_htpLock, portMAX_DELAY);
+    int g = htpOldestGroup();
+    uint64_t startUs = g < 0 ? 0 : s_htpQ[g].meta[s_htpQ[g].head].tStartUs;
+    xSemaphoreGive(s_htpLock);
+    if (g < 0) return 0;
+    return htpNowMs() - (int64_t)(startUs / 1000ULL) - 1000;
+}
+
+// Copies consecutive seqs from the head of group g into s_htpPost under one
+// header. send_timestamp_ms is the time of this attempt, not of encoding, so a
+// retried frame does not report its queue wait as network latency.
+static uint8_t htpBuildPost(int g, size_t *len, uint64_t *newestStartUs) {
+    const HtpGroupQueue &q = s_htpQ[g];
+    uint32_t first = q.meta[q.head].seq;
+    uint8_t n = 0;
+    size_t off = HTP_HEADER_BYTES;
+    while (n < q.count && n < HTP_POST_MAX_WINDOWS) {
+        int slot = htpSlot(q, n);
+        if (q.meta[slot].seq != first + n) break;
+        memcpy(s_htpPost + off, q.bytes + (size_t)slot * q.windowBytes, q.windowBytes);
+        off += q.windowBytes;
+        *newestStartUs = q.meta[slot].tStartUs;
+        n++;
+    }
+    htpWriteHeader(s_htpPost, s_htpSession, HTP_CHANNEL_SET_ID, kHtpGroups[g].key, n, first,
+                   (uint64_t)htpNowMs());
+    *len = off;
+    return n;
+}
+
 #if TELEMETRY_USE_WIFI && WIFI_AP_MODE
-static int httpPostJson(const char *json, size_t len) {
-    (void)json;
+static int httpPostHtp(const uint8_t *body, size_t len, String &response) {
+    (void)body;
     (void)len;
-    return 0; // no route to the ingest host from the SoftAP
+    response = "";
+    return 0;
 }
 #else
-static int httpPostJson(const char *json, size_t len) {
-    if (!networkBearerUp() || !strlen(HTTPS_INGEST_URL) || !strlen(HTTPS_API_KEY)) {
-        return 0;
+static void hmacHex(const uint8_t *body, size_t len, char out[65]) {
+    uint8_t mac[32];
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    int rc = mbedtls_md_hmac(info,
+                             reinterpret_cast<const unsigned char *>(TELEMETRY_HMAC_KEY),
+                             strlen(TELEMETRY_HMAC_KEY),
+                             body, len, mac);
+    if (rc != 0) {
+        out[0] = '\0';
+        return;
     }
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = digits[mac[i] >> 4];
+        out[i * 2 + 1] = digits[mac[i] & 0x0f];
+    }
+    out[64] = '\0';
+}
+
+static int httpPostOnce(const uint8_t *body, size_t len, const char *sig, String &response) {
     HTTPClient http;
-    if (!http.begin(netClient, HTTPS_INGEST_URL)) {
-        return 0;
-    }
+    if (!http.begin(netClient, HTTPS_INGEST_URL)) return 0;
     http.setConnectTimeout(HTTPS_POST_TIMEOUT_MS);
     http.setTimeout(HTTPS_POST_TIMEOUT_MS);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", HTTPS_API_KEY);
-    // Legacy anon keys are JWTs (eyJ...). Publishable keys (sb_publishable_...)
-    // are not, and Supabase rejects them if they are also sent as a Bearer token.
-    if (strncmp(HTTPS_API_KEY, "eyJ", 3) == 0) {
-        http.addHeader("Authorization", String("Bearer ") + HTTPS_API_KEY);
-    }
-    http.addHeader("Prefer", "return=minimal");
-    int code = http.POST(reinterpret_cast<uint8_t *>(const_cast<char *>(json)), len);
+    http.addHeader("Content-Type", "application/x-htp");
+    http.addHeader("x-htp-device", HTP_DEVICE_ID);
+    http.addHeader("x-htp-signature", sig);
+    int code = http.POST(const_cast<uint8_t *>(body), len);
+    response = http.getString();
+    // Leaves the TLS socket open in netClient when the server allows keep-alive.
     http.end();
+    return code;
+}
+
+static int httpPostHtp(const uint8_t *body, size_t len, String &response) {
+    response = "";
+    if (!networkBearerUp() || !s_htpConfigOk) return 0;
+    char sig[65];
+    hmacHex(body, len, sig);
+    if (sig[0] == '\0') return 0;
+
+    // A kept-alive socket the server has since closed still reads as connected
+    // until the first write fails. Retry once on a fresh connection instead of
+    // waiting out a backoff; a duplicate delivery is deduped by seq.
+    s_htpLastReused = netClient.connected();
+    int code = httpPostOnce(body, len, sig, response);
+    if (code < 0 && s_htpLastReused) {
+        netClient.stop();
+        s_htpLastReused = false;
+        code = httpPostOnce(body, len, sig, response);
+    }
 #if !TELEMETRY_USE_WIFI
-    // Negative = HTTPClient never got a response (connect/TLS/send failed).
     if (code >= 0) {
         s_postFailStreak = 0;
     } else if (++s_postFailStreak >= POST_FAILS_BEFORE_PPP_RESET) {
@@ -526,204 +728,194 @@ static int httpPostJson(const char *json, size_t len) {
 }
 #endif
 
-static bool ingestStored(int code) { return code >= 200 && code < 300; }
-static bool ingestAlreadyStored(int code) { return code == 409; }
-static bool ingestRetryable(int code) {
+// How many seqs of [first, first+n) the ack lists in acked or dup; -1 = not JSON.
+// serverMs is the function's own processing time (server_send - server_recv).
+static int ackedCount(const String &body, uint32_t first, uint8_t n, int32_t *serverMs) {
+    JsonDocument doc;
+    if (deserializeJson(doc, body) != DeserializationError::Ok) return -1;
+    uint32_t seen = 0;
+    for (const char *key : {"acked", "dup"}) {
+        JsonArray arr = doc[key].as<JsonArray>();
+        for (JsonVariant v : arr) {
+            uint32_t d = v.as<uint32_t>() - first;
+            if (d < n) seen |= 1u << d;
+        }
+    }
+    *serverMs = (int32_t)(doc["server_send_ms"].as<int64_t>() - doc["server_recv_ms"].as<int64_t>());
+    return __builtin_popcount(seen);
+}
+
+static bool htpRetryable(int code) {
     return code <= 0 || code == 408 || code == 429 || code >= 500;
 }
 
-// ---- Offline spooling (LittleFS) -----------------------------------------
-// Resume numbering above the highest spool file already on disk. LittleFS
-// survives reboots and reflashes, but this counter did not: it restarted at 0
-// every boot, so a new run overwrote the batches a previous run had spooled --
-// silently destroying exactly the data spooling exists to preserve, and
-// leaving a mix of old and new files sharing the same names.
-static void initSpoolCounter() {
-    File dir = LittleFS.open(SPOOL_DIR);
-    if (!dir || !dir.isDirectory()) return;
-
-    int maxIdx = -1;
-    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-        String name(f.name());
-        int slash = name.lastIndexOf('/');
-        if (slash >= 0) {
-            name = name.substring(slash + 1);  // some cores report a full path
-        }
-        int idx = name.toInt();  // "0000000004.json" -> 4
-        if (idx > maxIdx) maxIdx = idx;
-    }
-    s_spoolFileCounter = maxIdx + 1;
-    if (s_spoolFileCounter > 0) {
-        Serial.printf("[net] resuming spool numbering at %d\n", s_spoolFileCounter);
-    }
+static uint32_t htpBackoffDelay() {
+    uint32_t span = s_htpBackoffMs / 5;
+    uint32_t jitter = span == 0 ? 0 : (esp_random() % (2 * span + 1));
+    return s_htpBackoffMs - span + jitter;
 }
 
-static void spoolBatch(const String &json) {
-    // Drop-oldest cap: if the spool directory is full, delete the oldest
-    // file before writing a new one, mirroring the in-memory queue's policy.
-    File dir = LittleFS.open(SPOOL_DIR);
-    if (dir && dir.isDirectory()) {
-        std::vector<String> names;
-        for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-            names.push_back(String(f.name()));
-        }
-        if ((int)names.size() >= SPOOL_MAX_FILES) {
-            std::sort(names.begin(), names.end());
-            LittleFS.remove(String(SPOOL_DIR) + "/" + names.front());
-        }
+static void htpNoteFailure() {
+    uint32_t wait = htpBackoffDelay();
+    s_htpNextSendMs = millis() + wait;
+    if (s_htpBackoffMs < HTP_BACKOFF_MAX_MS) {
+        s_htpBackoffMs = std::min<uint32_t>(s_htpBackoffMs * 2, HTP_BACKOFF_MAX_MS);
     }
+    Serial.printf("[htp] retry in %lu ms\n", (unsigned long)wait);
+}
 
-    char path[64];
-    snprintf(path, sizeof(path), "%s/%010d.json", SPOOL_DIR, s_spoolFileCounter++);
-    File f = LittleFS.open(path, "w");
-    if (!f) {
-        Serial.println("[net] failed to open spool file for write");
+static void htpSendNext() {
+    if (!s_htpConfigOk || !networkBearerUp()) return;
+    if ((int32_t)(millis() - s_htpNextSendMs) < 0) return;
+    xSemaphoreTake(s_htpLock, portMAX_DELAY);
+    int g = htpOldestGroup();
+    if (g < 0) {
+        xSemaphoreGive(s_htpLock);
         return;
     }
-    f.print(json);
-    f.close();
-    Serial.printf("[net] spooled batch to %s\n", path);
+    HtpGroupQueue &q = s_htpQ[g];
+    size_t len = 0;
+    uint64_t newestStartUs = 0;
+    uint32_t first = q.meta[q.head].seq;
+    uint8_t n = htpBuildPost(g, &len, &newestStartUs);
+    xSemaphoreGive(s_htpLock);
+    // End of the newest window in this POST: what the dashboard would show.
+    int64_t newestEndMs = (int64_t)(newestStartUs / 1000ULL) + 1000;
+
+    String response;
+    uint32_t t0 = millis();
+    int code = httpPostHtp(s_htpPost, len, response);
+    uint32_t reqMs = millis() - t0;
+    s_htpStats.reqMsSum += reqMs;
+    s_htpStats.reqMsMax = std::max(s_htpStats.reqMsMax, reqMs);
+
+    if (code == 200) {
+        int32_t serverMs = 0;
+        int listed = ackedCount(response, first, n, &serverMs);
+        if (listed == n) {
+            htpDequeueRange(q, first, n);
+            s_htpStats.postsOk++;
+            s_htpStats.windowsAcked += n;
+            if (s_htpLastReused) s_htpStats.reused++;
+            // age = how old the newest sample in this POST was when its ack came back.
+            Serial.printf("[htp] g%u seq=%lu+%u (%u B) 200 in %lu ms (server %ld ms, %s) "
+                          "age=%lld ms queued=%d/%d/%d\n",
+                          kHtpGroups[g].key, (unsigned long)first, n, (unsigned)len,
+                          (unsigned long)reqMs, (long)serverMs, s_htpLastReused ? "reused" : "new conn",
+                          (long long)(htpNowMs() - newestEndMs),
+                          s_htpQ[0].count, s_htpQ[1].count, s_htpQ[2].count);
+            s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
+            s_htpNextSendMs = 0;
+            return;
+        }
+        s_htpStats.postsFailed++;
+        if (listed < 0) {
+            Serial.println("[htp] HTTP 200 but ack was not JSON; will retry the same frame");
+            htpNoteFailure();
+            return;
+        }
+        s_htpPermanentErrors += n;
+        Serial.printf("[htp] HTTP 200 acked %d of %u windows from seq=%lu; dropping them "
+                      "(permanent=%lu)\n",
+                      listed, n, (unsigned long)first, (unsigned long)s_htpPermanentErrors);
+        htpDequeueRange(q, first, n);
+        s_htpNextSendMs = 0;
+        return;
+    }
+    s_htpStats.postsFailed++;
+    if (htpRetryable(code)) {
+        Serial.printf("[htp] POST failed HTTP %d after %lu ms, resending g%u seq=%lu+%u\n",
+                      code, (unsigned long)reqMs, kHtpGroups[g].key, (unsigned long)first, n);
+        // The function does not create sessions. Keep retrying: once the row
+        // exists the queued windows go through.
+        if (response.indexOf("session_id_fkey") >= 0) {
+            Serial.printf("[htp] session %s is not a telemetry.sessions row; create it "
+                          "(service role) or change HTP_SESSION_ID\n", HTP_SESSION_ID);
+        }
+        htpNoteFailure();
+        return;
+    }
+    s_htpPermanentErrors += n;
+    Serial.printf("[htp] POST rejected HTTP %d, dropping g%u seq=%lu+%u (permanent=%lu)\n",
+                  code, kHtpGroups[g].key, (unsigned long)first, n,
+                  (unsigned long)s_htpPermanentErrors);
+    if (response.length() > 0) {
+        Serial.println(response.substring(0, 160));
+    }
+    htpDequeueRange(q, first, n);
+    s_htpBackoffMs = HTP_BACKOFF_INITIAL_MS;
+    s_htpNextSendMs = 0;
 }
 
-// Replays a bounded number of spooled batches per call so this never starves
-// live traffic if a large backlog has built up.
-//
-// Rate-limited with backoff. Without it this runs on every pass of the net
-// task's 50ms loop, so a batch that cannot post is retried ~20x/second --
-// each attempt opening TLS and shoving kilobytes at the modem. On a metered
-// SIM that costs real money to accomplish nothing.
-static void replaySpooledBatches() {
-    if (!networkBearerUp()) return;
-
+// busy = share of the interval spent inside POSTs. Near 100% the uplink cannot
+// keep up and queued/oldest grow; that is the number to watch before tuning.
+static void htpLogStats() {
     uint32_t now = millis();
-    if (now - s_lastReplayMs < s_replayBackoffMs) return;
-    s_lastReplayMs = now;
+    uint32_t span = now - s_htpStatsStartMs;
+    if (span < HTP_STATS_INTERVAL_MS) return;
+    const HtpStats &s = s_htpStats;
+    uint32_t posts = s.postsOk + s.postsFailed;
+    Serial.printf("[htp] stats %lus: posts %lu ok/%lu failed, %lu windows (%.1f/s), "
+                  "req avg %lu max %lu ms, busy %lu%%, reused %lu/%lu, queued %d/%d/%d, "
+                  "oldest %lld ms, dropped %lu, rejected %lu\n",
+                  (unsigned long)(span / 1000), (unsigned long)s.postsOk,
+                  (unsigned long)s.postsFailed, (unsigned long)s.windowsAcked,
+                  s.windowsAcked * 1000.0f / span,
+                  (unsigned long)(posts ? s.reqMsSum / posts : 0), (unsigned long)s.reqMsMax,
+                  (unsigned long)(s.reqMsSum * 100ULL / span), (unsigned long)s.reused,
+                  (unsigned long)s.postsOk, s_htpQ[0].count, s_htpQ[1].count, s_htpQ[2].count,
+                  (long long)htpOldestAgeMs(), (unsigned long)s_htpDroppedOldest,
+                  (unsigned long)s_htpPermanentErrors);
+    s_htpStats = {};
+    s_htpStatsStartMs = now;
+}
 
-    File dir = LittleFS.open(SPOOL_DIR);
-    if (!dir || !dir.isDirectory()) return;
-
-    std::vector<String> names;
-    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-        names.push_back(String(f.name()));
+void netTaskPushWindow(int group, uint64_t tStartUs, const float *samples) {
+    if (!s_htpConfigOk || group < 0 || group >= HTP_GROUP_COUNT) return;
+    // A window is identified by its start second, so a reboot into the same
+    // session never reuses a seq.
+    uint32_t seq = (uint32_t)(tStartUs / 1000000ULL);
+    uint8_t frame[HTP_MAX_FRAME_BYTES];
+    // send_timestamp_ms is rewritten by htpBuildPost().
+    size_t len = htpEncodeFrame(frame, sizeof(frame), s_htpSession, HTP_CHANNEL_SET_ID,
+                                &kHtpGroups[group], seq, 0, 1, &tStartUs, samples);
+    if (len == 0) {
+        Serial.printf("[htp] encode failed group=%u seq=%lu\n", kHtpGroups[group].key,
+                      (unsigned long)seq);
+        return;
     }
-    std::sort(names.begin(), names.end());
+    xSemaphoreTake(s_htpLock, portMAX_DELAY);
+    htpEnqueue(group, seq, tStartUs, frame, len);
+    xSemaphoreGive(s_htpLock);
+}
 
-    const int maxPerCall = 5;
-    int replayed = 0;
-    for (const String &name : names) {
-        if (replayed >= maxPerCall || !networkBearerUp()) break;
-        String path = String(SPOOL_DIR) + "/" + name;
-        File f = LittleFS.open(path, "r");
-        if (!f) continue;
-        String payload = f.readString();
-        f.close();
-
-        int code = httpPostJson(payload.c_str(), payload.length());
-        if (ingestStored(code) || ingestAlreadyStored(code)) {
-            LittleFS.remove(path);
-            replayed++;
-            s_replayBackoffMs = SPOOL_REPLAY_INTERVAL_MS;
-        } else if (!ingestRetryable(code)) {
-            // A 401/404/422 will fail the same way on every retry, and the
-            // break below would pin the rest of the spool behind it.
-            Serial.printf("[net] discarding %s: HTTP %d will not succeed on retry\n",
-                          path.c_str(), code);
-            LittleFS.remove(path);
-        } else {
-            s_replayBackoffMs = std::min<uint32_t>(s_replayBackoffMs * 2,
-                                                   SPOOL_REPLAY_MAX_BACKOFF_MS);
-            Serial.printf("[net] spool replay failed for %s (%u bytes, HTTP %d), "
-                          "retry in %lu ms\n",
-                          path.c_str(), (unsigned)payload.length(), code,
-                          (unsigned long)s_replayBackoffMs);
-            break;
+static void htpMaintain() {
+    htpLogConfigOnce();
+    if (!s_htpConfigOk) return;
+    if (!g_timeSync.isSynced()) {
+        static uint32_t last = 0;
+        if (millis() - last > 5000) {
+            last = millis();
+            Serial.println("[htp] waiting for SNTP; the sampler starts with the clock");
+        }
+        return;
+    }
+    if (s_htpStatsStartMs == 0) s_htpStatsStartMs = millis();
+    htpSendNext();
+    htpLogStats();
+    if (s_htpDroppedOldest && (s_htpDroppedOldest % 10) == 0) {
+        static uint32_t reported = 0;
+        if (reported != s_htpDroppedOldest) {
+            reported = s_htpDroppedOldest;
+            Serial.printf("[htp] dropped oldest windows: %lu\n", (unsigned long)s_htpDroppedOldest);
         }
     }
-    if (replayed > 0) {
-        Serial.printf("[net] replayed %d spooled batch(es)\n", replayed);
-    }
 }
 
-// ---- Batch drain + POST ---------------------------------------------------
-// Builds and POSTs one batch of at most maxFrames frames, also capped by
-// BATCH_MAX_FRAMES and by BATCH_MAX_JSON_BYTES of serialized JSON: with
-// 64-byte CAN FD frames a frame-count cap alone would overshoot it ~2x.
-// Returns the number of frames taken off the queue, or -1 if the batch was
-// not stored (spooled, or dropped on a non-retryable HTTP status).
-static int publishOneBatch(int maxFrames) {
-    // Batch header (device_id, seq, dropped_frames, brackets).
-    static const size_t kBudget = BATCH_MAX_JSON_BYTES - strlen(TELEMETRY_DEVICE_ID) - 96;
-
-    TelemetryBatch batch;
-    batch.dropped_frames = canHandlerTakeDroppedCount();
-
-    size_t bytes = 0;
-    CanFrame f;
-    while ((int)batch.frames.size() < std::min(maxFrames, BATCH_MAX_FRAMES) &&
-           xQueuePeek(g_canQueue, &f, 0) == pdTRUE) {
-        size_t frameBytes = telemetryFrameJsonMaxBytes(f);
-        if (!batch.frames.empty() && bytes + frameBytes > kBudget) break;
-        xQueueReceive(g_canQueue, &f, 0); // sole consumer: this is the frame just peeked
-        batch.frames.push_back(f);
-        bytes += frameBytes;
-    }
-
-    if (batch.frames.empty() && batch.dropped_frames == 0) {
-        return 0; // nothing to report this window
-    }
-    batch.seq = s_batchSeq++;
-
-    String json = telemetryFormatBatch(batch, TELEMETRY_DEVICE_ID, timeSyncEpochMsFor);
-    int code = httpPostJson(json.c_str(), json.length());
-
-    if (ingestStored(code)) {
-        Serial.printf("[net] posted batch seq=%lu frames=%u bytes=%u dropped=%u (HTTP %d)\n",
-                      (unsigned long)batch.seq, (unsigned)batch.frames.size(),
-                      (unsigned)json.length(), (unsigned)batch.dropped_frames, code);
-        return (int)batch.frames.size();
-    }
-    if (ingestAlreadyStored(code)) {
-        Serial.printf("[net] batch seq=%lu already stored (HTTP 409), not spooling\n",
-                      (unsigned long)batch.seq);
-        return (int)batch.frames.size();
-    }
-    if (!ingestRetryable(code)) {
-        Serial.printf("[net] POST rejected (HTTP %d), dropping seq=%lu -- "
-                      "check HTTPS_INGEST_URL, HTTPS_API_KEY, and the table schema\n",
-                      code, (unsigned long)batch.seq);
-        return -1;
-    }
-    Serial.printf("[net] POST failed (HTTP %d), spooling seq=%lu\n",
-                  code, (unsigned long)batch.seq);
-    spoolBatch(json);
-    return -1;
-}
-
-// Publishes everything that was queued when the window opened, in as many
-// batches as it takes. One capped batch per window bounded sustained
-// throughput at BATCH_MAX_FRAMES / BATCH_WINDOW_MS (4 frames/s at the
-// defaults) however fast the uplink was, silently overflowing the queue
-// above that. Frames arriving mid-drain wait for the next window, so a bus
-// faster than the uplink can't pin the net task here; and the first failed
-// publish stops the drain, so an outage still spools one batch per window.
-static void drainAndPublish() {
-    int pending = (int)uxQueueMessagesWaiting(g_canQueue);
-    do {
-        int taken = publishOneBatch(pending);
-        if (taken <= 0) break;
-        pending -= taken;
-    } while (pending > 0);
-}
 
 // ---- Task ------------------------------------------------------------
 static void netTask(void *) {
-    if (!LittleFS.begin(true)) {
-        Serial.println("[net] LittleFS mount/format failed; spooling disabled");
-    } else if (!LittleFS.exists(SPOOL_DIR)) {
-        LittleFS.mkdir(SPOOL_DIR);
-    } else {
-        initSpoolCounter();
-    }
+    htpLogConfigOnce();
 
 #if !TELEMETRY_USE_WIFI
     modemPowerPins();
@@ -739,12 +931,6 @@ static void netTask(void *) {
 #if !(TELEMETRY_USE_WIFI && WIFI_AP_MODE)
     // Encrypted, certificate not checked. See HTTPS_INGEST_URL in telemetry_config.h.
     netClient.setInsecure();
-    if (!strlen(HTTPS_INGEST_URL) || !strlen(HTTPS_API_KEY)) {
-        Serial.println("[net] HTTPS_INGEST_URL or HTTPS_API_KEY is empty; "
-                       "batches will spool until .env is set and the board is reflashed");
-    } else {
-        Serial.printf("[net] HTTPS ingest: %s\n", HTTPS_INGEST_URL);
-    }
 #endif
 
     ensureNetworkConnected();
@@ -799,20 +985,20 @@ static void netTask(void *) {
             }
         }
 #endif
-        replaySpooledBatches();
-
-        if (now - s_lastBatchMs >= BATCH_WINDOW_MS) {
-            s_lastBatchMs = now;
-            drainAndPublish();
-        }
+        htpMaintain();
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 void netTaskStart() {
+    // Before the task (and the sampler) start, so netTaskPushWindow never sees
+    // a half-built queue.
+    s_htpLock = xSemaphoreCreateMutex();
+    s_htpSessionOk = htpParseUuid(HTP_SESSION_ID, s_htpSession);
+    s_htpConfigOk = s_htpLock && htpConfigReady() && htpQueuesInit();
     // TLS handshakes run in mbedTLS on this task's stack. HTTPClient adds another
     // buffer on top of the handshake, so this is larger than the MQTT task was.
-    xTaskCreatePinnedToCore(netTask, "net_task", 16384, nullptr, tskIDLE_PRIORITY + 2,
+    xTaskCreatePinnedToCore(netTask, "net_task", 24576, nullptr, tskIDLE_PRIORITY + 2,
                              nullptr, 1);
 }

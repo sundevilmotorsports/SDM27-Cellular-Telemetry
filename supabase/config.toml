@@ -1,0 +1,8 @@
+# Deploy config for the HTP ingest function on the team's hosted project.
+# This is not Helios's project. JWT verification must stay off: the car
+# authenticates with HMAC headers, and the function checks those itself.
+
+project_id = "sdm27-cellular-telemetry"
+
+[functions.telemetry-ingest]
+verify_jwt = false

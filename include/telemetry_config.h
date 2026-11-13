@@ -1,6 +1,6 @@
 // User-editable configuration for the telemetry PoC.
-// Fill in your APN and HTTPS ingest URL before flashing the real-CAN or
-// cellular-connectivity paths. Batches are POSTed as JSON; there is no broker.
+// Fill in your APN and HTTPS ingest URL before flashing. The uplink is binary
+// HTP/1 to the telemetry-ingest edge function. There is no broker.
 //
 // Credentials (WiFi/APN/HTTPS) below are wrapped in #ifndef guards: copy
 // .env.example to .env (git-ignored) and fill in real values there instead
@@ -18,17 +18,16 @@
 #define TELEMETRY_USE_SIMULATED_CAN 1
 #endif
 
-// Simulated CAN generator settings (only used when
-// TELEMETRY_USE_SIMULATED_CAN=1)
-// NOTE: these rates are deliberately far below a real bus's. On a metered SIM
-// the generator rate, not the batching, sets your data bill: every simulated
-// frame costs ~90 bytes of JSON on the wire. 100+5 Hz (the original bench
-// values, fine over WiFi) works out to ~34 MB/hour. Raise these only when the
-// link is unmetered.
-#define SIM_CAN_FAST_ID 0x100 // e.g. wheel speed / RPM, high rate
-#define SIM_CAN_FAST_RATE_HZ 1
-#define SIM_CAN_SLOW_ID 0x200 // e.g. status frame, low rate
-#define SIM_CAN_SLOW_RATE_HZ 1
+// Simulated CAN source (TELEMETRY_USE_SIMULATED_CAN=1, HTP_SYNTH_MODE=0):
+// sends the bench ECU pattern (include/bench_ecu_pattern.h) at 10 Hz plus a
+// counter frame on this id. Build with CAN_MAP_BENCH=1 to decode them.
+#define SIM_CAN_FAST_ID 0x100
+
+// A CAN channel not received for this long is sent as a dropout instead of
+// its last value. Above 1 s so a 1 Hz frame with some jitter stays fresh.
+#ifndef CAN_STALE_MS
+#define CAN_STALE_MS 1500
+#endif
 
 // ---- Uplink stress test ---------------------------------------------------
 // Opt-in, off by default. The burst used to publish filler over MQTT. That
@@ -91,8 +90,8 @@
 // Only used when TELEMETRY_USE_WIFI=1.
 // 1 = SoftAP -- the ESP32-S3 hosts its own WiFi network (WIFI_AP_SSID/
 //     _PASSWORD below); your laptop/phone joins IT. No existing WiFi network
-//     needed, but there is no route to the ingest host either, so batches are
-//     spooled and not POSTed. Timestamps will NOT be network-synced in this
+//     needed, but there is no route to the ingest host either, so nothing is
+//     POSTed. Timestamps will NOT be network-synced in this
 //     mode (no internet uplink for NTP); relative inter-frame timing is
 //     unaffected, see README's Known Limitations.
 // 0 = station -- the ESP32-S3 joins an existing WiFi network (WIFI_SSID
@@ -168,28 +167,66 @@
 // How long to wait for an IP once the modem has switched to PPP data mode.
 #define PPP_CONNECT_TIMEOUT_MS 30000
 
-// ---- HTTPS ingest ------------------------------------------------------
-// One POST per batch. The body is the JSON from telemetryFormatBatch()
-// (device_id, seq, dropped_frames, frames). For Supabase PostgREST the URL is
-// https://<project-ref>.supabase.co/rest/v1/<table>
-// and HTTPS_API_KEY is the publishable key (sb_publishable_...) or the legacy
-// anon JWT. It is sent as the apikey header. Do not put the secret key here.
+// ---- HTTPS ingest (Helios HTP/1) ---------------------------------------
+// One POST carries 1..HTP_POST_MAX_WINDOWS one-second windows of one group,
+// body is binary HTP/1 for channel set 1.
+// URL is the edge function, not PostgREST:
+//   https://<project-ref>.supabase.co/functions/v1/telemetry-ingest
+// Auth is HMAC-SHA256 of the raw body, sent as x-htp-signature. Do not send
+// apikey, Authorization, or any Supabase secret. The HMAC key is the device
+// key (TELEMETRY_HMAC_KEY), the same value set on the function.
+//
+// HTP_SESSION_ID must already be a row in telemetry.sessions. A random UUID
+// that is not a row is rejected. Channel set 1 must be seeded.
 //
 // TLS runs on the ESP32 (mbedTLS over PPP, or WiFiClientSecure on WiFi STA).
 // netClient.setInsecure() means the link is encrypted but the certificate is
 // not checked. setCACert() would close that gap.
 //
-// Put the real values in .env, not in this file:
-//   HTTPS_INGEST_URL=https://<project-ref>.supabase.co/rest/v1/batches
-//   HTTPS_API_KEY=<anon key>
+// Put the real values in .env, not in this file. An edit without a reflash
+// does nothing. Do not print the HMAC key.
+//   HTTPS_INGEST_URL=https://<project-ref>.supabase.co/functions/v1/telemetry-ingest
+//   TELEMETRY_HMAC_KEY=<device hmac key>
+//   HTP_DEVICE_ID=esp32-sim7670g-poc-01
+//   HTP_SESSION_ID=<uuid of a telemetry.sessions row>
+//   HTP_CHANNEL_SET_ID=1
 #ifndef HTTPS_INGEST_URL
 #define HTTPS_INGEST_URL ""
 #endif
-#ifndef HTTPS_API_KEY
-#define HTTPS_API_KEY ""
+#ifndef TELEMETRY_HMAC_KEY
+#define TELEMETRY_HMAC_KEY ""
 #endif
+#ifndef HTP_DEVICE_ID
+#define HTP_DEVICE_ID "esp32-sim7670g-poc-01"
+#endif
+#ifndef HTP_SESSION_ID
+#define HTP_SESSION_ID ""
+#endif
+#ifndef HTP_CHANNEL_SET_ID
+#define HTP_CHANNEL_SET_ID 1
+#endif
+// 1 = synth samples for every channel in set 1, and do not start the CAN task.
+// 0 = sample the CAN map (can_map.h): channels come from the table picked by
+//     CAN_MAP_BENCH. The car table is empty until it is generated from the
+//     logger's config.json, so with 0 and no table every channel is a dropout.
+#ifndef HTP_SYNTH_MODE
+#define HTP_SYNTH_MODE 1
+#endif
+// Windows kept per group (one per second, so ~32 s of backlog each). Oldest
+// is dropped beyond this.
+#define HTP_RETRY_QUEUE_MAX 32
+// Windows per POST (protocol max 8). A group with a backlog sends up to this
+// many consecutive windows in one request, so a slow uplink makes fewer,
+// larger POSTs instead of falling further behind.
+#ifndef HTP_POST_MAX_WINDOWS
+#define HTP_POST_MAX_WINDOWS 8
+#endif
+// Period of the "[htp] stats" serial line (request time, busy %, queue age).
+#define HTP_STATS_INTERVAL_MS 10000
+#define HTP_BACKOFF_INITIAL_MS 1000
+#define HTP_BACKOFF_MAX_MS 8000
 // How long one POST, including the TLS handshake, may take before it is
-// treated as a failure and the batch is spooled.
+// treated as a failure and retried after a backoff.
 #define HTTPS_POST_TIMEOUT_MS 15000
 
 // ---- Device identity -----------------------------------------------
