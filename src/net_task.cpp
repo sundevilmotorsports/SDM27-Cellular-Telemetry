@@ -486,8 +486,11 @@ static void restartStalePpp() {
 // server files it under the device's running session, which a signed-in user
 // starts from the dashboard; the board never knows a session id.
 //
-// One batch is in flight at a time and is kept byte for byte until the server
-// has it (2xx, including a dup), so a retry carries the same seq. Meanwhile
+// One batch is in flight at a time and is kept until the server has it (2xx,
+// including a dup), so a retry carries the same seq and frames. Only sent_ms
+// changes: it is the Unix ms of each attempt, written into the body (fixed
+// 13 digits, in place) and signed just before the POST, so the dashboard can
+// compare it with received_at for uplink latency. Meanwhile
 // new frames wait in the CAN queue and the next batch takes as many as fit, so
 // a slow or stalled uplink makes fewer, bigger batches instead of a backlog of
 // small ones. When the queue overflows the oldest frames go, and the count
@@ -524,7 +527,11 @@ struct RawBatch {
     uint32_t frames;
     uint32_t dropped;  // dropped_frames written into this batch
     int64_t oldestMs;  // ts_ms of the first frame
+    size_t sentOff;    // offset of the RAW_SENT_DIGITS digits of sent_ms in body
 };
+
+// Unix ms has 13 digits from 2001 to 2286.
+#define RAW_SENT_DIGITS 13
 
 static RawBatch s_batch = {};
 static RawStats s_rawStats = {};
@@ -593,6 +600,14 @@ static int64_t rawNowMs() {
     return g_timeSync.epochMsFor(esp_timer_get_time());
 }
 
+// Overwrites the batch's sent_ms digits with the current time. The width
+// never changes, so neither does the body length.
+static void rawStampSent() {
+    char digits[24];
+    int n = snprintf(digits, sizeof digits, "%lld", (long long)rawNowMs());
+    if (n == RAW_SENT_DIGITS) memcpy(s_batch.body + s_batch.sentOff, digits, RAW_SENT_DIGITS);
+}
+
 // Drains up to RAW_BATCH_MAX_FRAMES frames (and RAW_BATCH_MAX_BYTES of JSON)
 // from the CAN queue into s_batch. Leaves s_batch empty if the queue was.
 static void rawBuildBatch() {
@@ -607,10 +622,15 @@ static void rawBuildBatch() {
     if (seq <= s_rawLastSeq) seq = s_rawLastSeq + 1; // two builds in one ms, or a clock step back
     char *b = s_batch.body;
     const size_t cap = RAW_BATCH_MAX_BYTES;
-    int n = snprintf(b, cap, "{\"device_id\":\"%s\",\"seq\":%llu,\"dropped_frames\":%lu,\"frames\":[",
-                     HTP_DEVICE_ID, (unsigned long long)seq, (unsigned long)dropped);
-    if (n <= 0 || (size_t)n >= cap) return;
-    size_t off = (size_t)n;
+    int n = snprintf(b, cap, "{\"device_id\":\"%s\",\"seq\":%llu,\"sent_ms\":",
+                     HTP_DEVICE_ID, (unsigned long long)seq);
+    if (n <= 0 || (size_t)n + RAW_SENT_DIGITS >= cap) return;
+    size_t sentOff = (size_t)n;
+    memset(b + sentOff, '0', RAW_SENT_DIGITS);
+    n = snprintf(b + sentOff + RAW_SENT_DIGITS, cap - sentOff - RAW_SENT_DIGITS,
+                 ",\"dropped_frames\":%lu,\"frames\":[", (unsigned long)dropped);
+    if (n <= 0 || sentOff + RAW_SENT_DIGITS + (size_t)n >= cap) return;
+    size_t off = sentOff + RAW_SENT_DIGITS + (size_t)n;
     uint32_t frames = 0;
     int64_t oldestMs = 0;
     while (frames < RAW_BATCH_MAX_FRAMES && xQueuePeek(g_canQueue, &s_rawPeek, 0) == pdTRUE) {
@@ -638,13 +658,13 @@ static void rawBuildBatch() {
     s_batch.frames = frames;
     s_batch.dropped = dropped;
     s_batch.oldestMs = oldestMs;
+    s_batch.sentOff = sentOff;
+    rawStampSent();
     s_rawLastSeq = seq;
 }
 
 #if TELEMETRY_USE_WIFI && WIFI_AP_MODE
-static int httpPostRaw(const uint8_t *body, size_t len, String &response) {
-    (void)body;
-    (void)len;
+static int httpPostRaw(String &response) {
     response = "";
     return 0;
 }
@@ -683,10 +703,14 @@ static int httpPostOnce(const uint8_t *body, size_t len, const char *sig, String
     return code;
 }
 
-static int httpPostRaw(const uint8_t *body, size_t len, String &response) {
+// Posts s_batch, stamping sent_ms and signing right before each attempt.
+static int httpPostRaw(String &response) {
     response = "";
     if (!networkBearerUp() || !s_rawConfigOk) return 0;
+    const uint8_t *body = (const uint8_t *)s_batch.body;
+    size_t len = s_batch.len;
     char sig[65];
+    rawStampSent();
     hmacHex(body, len, sig);
     if (sig[0] == '\0') return 0;
 
@@ -698,6 +722,9 @@ static int httpPostRaw(const uint8_t *body, size_t len, String &response) {
     if (code < 0 && s_rawLastReused) {
         netClient.stop();
         s_rawLastReused = false;
+        rawStampSent();
+        hmacHex(body, len, sig);
+        if (sig[0] == '\0') return 0;
         code = httpPostOnce(body, len, sig, response);
     }
 #if !TELEMETRY_USE_WIFI
@@ -737,7 +764,7 @@ static void rawSendPending() {
 
     String response;
     uint32_t t0 = millis();
-    int code = httpPostRaw((const uint8_t *)s_batch.body, s_batch.len, response);
+    int code = httpPostRaw(response);
     uint32_t reqMs = millis() - t0;
     s_rawStats.reqMsSum += reqMs;
     s_rawStats.reqMsMax = std::max(s_rawStats.reqMsMax, reqMs);

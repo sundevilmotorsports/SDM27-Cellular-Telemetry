@@ -71,7 +71,7 @@ def batch(device, seq, first_step, t0_ms):
             if fd:
                 f["fd"], f["brs"] = True, True
             frames.append(f)
-    return {"device_id": device, "seq": seq, "dropped_frames": 0, "frames": frames}
+    return {"device_id": device, "seq": seq, "sent_ms": 0, "dropped_frames": 0, "frames": frames}
 
 
 def post(url, device, key, body):
@@ -99,8 +99,10 @@ def main():
     for _ in range(args.seconds):
         start = time.time()
         now_ms = int(start * 1000)
-        body = json.dumps(batch(args.device, now_ms, step, now_ms - 1000), separators=(",", ":")).encode()
+        b = batch(args.device, now_ms, step, now_ms - 1000)
         while True:
+            b["sent_ms"] = int(time.time() * 1000)  # per attempt, like the board
+            body = json.dumps(b, separators=(",", ":")).encode()
             code, text, secs = post(url, args.device, key, body)
             print(f"seq={now_ms} {len(body)} B -> {code} in {secs * 1000:.0f} ms {text[:120]}")
             if code != 409:

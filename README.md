@@ -196,6 +196,7 @@ JSON, documented in `include/telemetry_format.h`. One POST per batch:
 {
   "device_id": "esp32-sim7670g-poc-01",
   "seq": 1794533525123,
+  "sent_ms": 1794533525140,
   "dropped_frames": 0,
   "frames": [
     { "can_id": 1000, "extd": false, "dlc": 8, "data": "0003e80a14012c00", "ts_ms": 1794533524001 },
@@ -211,6 +212,11 @@ is lowercase hex with no prefix.
 
 `ts_ms` is Unix epoch milliseconds, per frame. `seq` is the batch's build
 time in Unix ms: unique per device even across power cuts (see below).
+`sent_ms` is when the POST left the board, in Unix ms, rewritten (and
+re-signed) on every retry, so `received_at - sent_ms` on the server is the
+uplink latency of that request (both clocks are NTP, so expect tens of ms of
+skew). `telemetry.can_batches` has no column for it yet, so the ingest
+function drops it until a `sent_at` column and the function are updated.
 `dropped_frames` counts frames lost since the previous batch: queue overflow,
 plus the frames of any batch the server rejected. `device_id` must match the
 signed `x-htp-device` header. At most 4096 frames per batch (server limit);
@@ -317,8 +323,9 @@ session). The function files each batch under the device's running session.
 How the board sends:
 
 - Once a second it drains the CAN queue into one batch and POSTs it. One
-  batch is in flight at a time and is resent byte for byte until the server
-  has it, so a retry carries the same `seq`.
+  batch is in flight at a time and is resent until the server has it, so a
+  retry carries the same `seq` and frames; only `sent_ms` (and so the
+  signature) changes.
 - While a POST is slow or failing, new frames wait in the queue and the next
   batch takes as many as fit (`RAW_BATCH_MAX_FRAMES`, `RAW_BATCH_MAX_BYTES`),
   so a stalled uplink catches up in a few big batches.

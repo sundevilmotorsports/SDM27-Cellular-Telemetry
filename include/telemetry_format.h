@@ -5,6 +5,7 @@
 //   {
 //     "device_id": "esp32-sim7670g-poc-01",
 //     "seq": 1794533525123,
+//     "sent_ms": 1794533525140,
 //     "dropped_frames": 0,
 //     "frames": [
 //       { "can_id": 256, "extd": false, "dlc": 8, "data": "0102030405060708", "ts_ms": 1794533525001 },
@@ -12,6 +13,9 @@
 //     ]
 //   }
 // `ts_ms` is Unix epoch milliseconds at the frame's own capture instant.
+// `sent_ms` is Unix epoch milliseconds when this POST attempt left the board
+// (rewritten on every retry; seq stays the same), for uplink latency against
+// the server's received_at.
 // `data` is the payload as lowercase hex, `dlc` bytes long. `dlc` is the
 // payload length in bytes (0-8 classic; 0-8, 12, 16, 20, 24, 32, 48, 64 FD),
 // not the 4-bit DLC code from the wire. CAN FD frames add `"fd": true` and
