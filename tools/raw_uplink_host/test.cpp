@@ -83,7 +83,9 @@ static uint32_t g_maxFrames = 0;
 static int goodServer(const uint8_t *b, size_t n, std::string &resp) {
     check(g_headers["Content-Type"] == "application/x-sdm-can-batch+json", "content type");
     check(g_headers["x-htp-device"] == HTP_DEVICE_ID, "device header");
-    check(g_headers["x-htp-signature"].size() == 64, "signature header");
+    char sig[65];
+    hmacHex(b, n, sig);
+    check(g_headers["x-htp-signature"] == sig, "signature matches the body");
     JsonDocument doc;
     if (deserializeJson(doc, (const char *)b, n) != DeserializationError::Ok) {
         check(false, "body is JSON");
@@ -94,6 +96,11 @@ static int goodServer(const uint8_t *b, size_t n, std::string &resp) {
     JsonArray frames = doc["frames"].as<JsonArray>();
     check(frames.size() >= 1 && frames.size() <= 4096, "1..4096 frames");
     uint64_t seq = doc["seq"].as<uint64_t>();
+    // The fake POST takes g_reqMs before the server sees it.
+    int64_t sentMs = doc["sent_ms"].as<int64_t>();
+    check(doc["sent_ms"].is<int64_t>() && sentMs >= (int64_t)seq &&
+          sentMs == g_timeSync.epochMsFor(esp_timer_get_time()) - g_reqMs,
+          "sent_ms is the time of this attempt");
     g_maxBody = std::max(g_maxBody, n);
     g_maxFrames = std::max<uint32_t>(g_maxFrames, frames.size());
     if (!g_seqs.insert(seq).second) {
@@ -239,15 +246,18 @@ int main(int argc, char **argv) {
     // 5. 503 twice, then OK: same seq resent after backoff.
     calls = 0;
     std::vector<uint64_t> seqs;
+    std::vector<int64_t> sents;
     g_server = [&](const uint8_t *b, size_t n, std::string &r) {
         JsonDocument d;
         deserializeJson(d, (const char *)b, n);
         seqs.push_back(d["seq"].as<uint64_t>());
+        sents.push_back(d["sent_ms"].as<int64_t>());
         if (++calls <= 2) { r = "{\"error\":\"x\"}"; return 503; }
         return goodServer(b, n, r);
     };
     run(6000);
     check(seqs.size() >= 3 && seqs[0] == seqs[1] && seqs[1] == seqs[2], "503: same batch resent");
+    check(sents.size() >= 3 && sents[0] < sents[1] && sents[1] < sents[2], "503: each retry has a new sent_ms");
     checkDelivery("503");
     printf("5 503 x2: seq %llu resent, then stored\n", (unsigned long long)seqs[0]);
 

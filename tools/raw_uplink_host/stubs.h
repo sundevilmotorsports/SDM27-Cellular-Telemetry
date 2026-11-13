@@ -90,8 +90,16 @@ struct HTTPClient {
 typedef int mbedtls_md_info_t;
 #define MBEDTLS_MD_SHA256 0
 static const mbedtls_md_info_t *mbedtls_md_info_from_type(int) { static int x; return &x; }
-static int mbedtls_md_hmac(const mbedtls_md_info_t *, const unsigned char *, size_t,
-                           const uint8_t *, size_t, uint8_t *mac) { memset(mac, 0xab, 32); return 0; }
+// Not HMAC, but it depends on key and body, so the fake server can tell a
+// signature that doesn't match the bytes it got.
+static int mbedtls_md_hmac(const mbedtls_md_info_t *, const unsigned char *key, size_t keyLen,
+                           const uint8_t *body, size_t n, uint8_t *mac) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < keyLen; i++) h = (h ^ key[i]) * 1099511628211ULL;
+    for (size_t i = 0; i < n; i++) h = (h ^ body[i]) * 1099511628211ULL;
+    for (int i = 0; i < 32; i++) mac[i] = (uint8_t)(h >> (8 * (i % 8))) ^ (uint8_t)i;
+    return 0;
+}
 
 // FreeRTOS queue, single-threaded.
 #define pdTRUE 1
