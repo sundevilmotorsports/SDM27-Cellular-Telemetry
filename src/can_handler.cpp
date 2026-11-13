@@ -1,11 +1,13 @@
 #include "can_handler.h"
-#include "can_map.h"
 #include "can_pins.h"
 #include "telemetry_config.h"
 #include <Arduino.h>
 #include <esp_timer.h>
+#include <atomic>
 #include <algorithm>
 #include <cstring>
+
+#include <freertos/idf_additions.h>
 
 #if TELEMETRY_USE_SIMULATED_CAN
 #include "bench_ecu_pattern.h"
@@ -15,26 +17,52 @@
 #include <driver/twai.h>
 #endif
 
-// Every received frame updates the CAN map in place; there is no frame queue.
-// The sampler reads the latest values at 10 Hz, so a frame costs one table
-// scan here and nothing on the uplink.
+QueueHandle_t g_canQueue = nullptr;
+static std::atomic<uint32_t> s_droppedFrames{0};
+
+uint32_t canHandlerTakeDroppedCount() {
+    return s_droppedFrames.exchange(0);
+}
+
+// The queue is the backlog while the uplink is slow or waiting for a session,
+// so it is deep: CAN_QUEUE_DEPTH frames of ~88 bytes, in PSRAM when the board
+// has it. Only tasks touch it (never an ISR), which is what makes PSRAM safe.
+static void createQueue() {
+    if (psramFound()) {
+        g_canQueue = xQueueCreateWithCaps(CAN_QUEUE_DEPTH, sizeof(CanFrame), MALLOC_CAP_SPIRAM);
+    }
+    if (!g_canQueue) {
+        g_canQueue = xQueueCreate(CAN_QUEUE_DEPTH_NO_PSRAM, sizeof(CanFrame));
+    }
+}
+
+// Pushes a captured frame without blocking. If the queue is full, drops the
+// oldest queued frame and counts it (reported in the next batch's
+// dropped_frames). Loops because the net task drains the queue from the other
+// core: a slot can free up between a failed send and the eviction, and then
+// nothing should be evicted.
 static void pushFrame(const CanFrame &frame) {
-    canMapApply(frame);
+    while (xQueueSend(g_canQueue, &frame, 0) != pdTRUE) {
+        CanFrame discard;
+        if (xQueueReceive(g_canQueue, &discard, 0) == pdTRUE) {
+            s_droppedFrames.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 }
 
 #if TELEMETRY_USE_SIMULATED_CAN
 
 // Sends the bench ECU pattern (include/bench_ecu_pattern.h, the same frames
-// the C5 generator sends with 'e') every BENCH_ECU_PERIOD_MS, plus a counter
-// frame on SIM_CAN_FAST_ID, through the same path as received frames. Decoded
-// only with CAN_MAP_BENCH=1; the car table ignores these ids.
+// the C5 generator sends with 'e') every BENCH_ECU_PERIOD_MS through the same
+// path as received frames. Its ids are the logger's, so the dashboard decodes it.
 static void canSimTask(void *) {
     uint32_t step = 0;
     TickType_t wake = xTaskGetTickCount();
     for (;;) {
-        BenchEcuFrame ecu[2];
-        benchEcuFrames(step, ecu);
-        for (const BenchEcuFrame &e : ecu) {
+        BenchEcuFrame ecu[BENCH_ECU_MAX_FRAMES];
+        int n = benchEcuFrames(step, ecu);
+        for (int k = 0; k < n; k++) {
+            const BenchEcuFrame &e = ecu[k];
             CanFrame f{};
             f.id = e.id;
             f.fd = e.fd;
@@ -44,20 +72,13 @@ static void canSimTask(void *) {
             f.capture_us = esp_timer_get_time();
             pushFrame(f);
         }
-        CanFrame c{};
-        c.id = SIM_CAN_FAST_ID;
-        c.dlc = 8;
-        c.data[0] = (uint8_t)step;
-        c.data[1] = (uint8_t)(step >> 8);
-        c.capture_us = esp_timer_get_time();
-        pushFrame(c);
         step++;
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(BENCH_ECU_PERIOD_MS));
     }
 }
 
 void canHandlerStart() {
-    canMapInit();
+    createQueue();
     xTaskCreatePinnedToCore(canSimTask, "can_sim", 4096, nullptr,
                              configMAX_PRIORITIES - 2, nullptr, 0);
 }
@@ -164,7 +185,7 @@ static void canMcpTask(void *) {
 }
 
 void canHandlerStart() {
-    canMapInit();
+    createQueue();
     xTaskCreatePinnedToCore(canMcpTask, "can_mcp", 4096, nullptr,
                              configMAX_PRIORITIES - 2, nullptr, 0);
 }
@@ -245,7 +266,7 @@ static void canTwaiTask(void *) {
 }
 
 void canHandlerStart() {
-    canMapInit();
+    createQueue();
     xTaskCreatePinnedToCore(canTwaiTask, "can_twai", 4096, nullptr,
                              configMAX_PRIORITIES - 2, nullptr, 0);
 }
