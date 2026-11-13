@@ -1,6 +1,7 @@
 // User-editable configuration for the telemetry PoC.
-// Fill in your APN and HTTPS ingest URL before flashing. The uplink is binary
-// HTP/1 to the telemetry-ingest edge function. There is no broker.
+// Fill in your APN and HTTPS ingest URL before flashing. The uplink is raw
+// CAN batches (JSON) POSTed to the telemetry-ingest edge function. There is no
+// broker.
 //
 // Credentials (WiFi/APN/HTTPS) below are wrapped in #ifndef guards: copy
 // .env.example to .env (git-ignored) and fill in real values there instead
@@ -18,16 +19,8 @@
 #define TELEMETRY_USE_SIMULATED_CAN 1
 #endif
 
-// Simulated CAN source (TELEMETRY_USE_SIMULATED_CAN=1, HTP_SYNTH_MODE=0):
-// sends the bench ECU pattern (include/bench_ecu_pattern.h) at 10 Hz plus a
-// counter frame on this id. Build with CAN_MAP_BENCH=1 to decode them.
-#define SIM_CAN_FAST_ID 0x100
-
-// A CAN channel not received for this long is sent as a dropout instead of
-// its last value. Above 1 s so a 1 Hz frame with some jitter stays fresh.
-#ifndef CAN_STALE_MS
-#define CAN_STALE_MS 1500
-#endif
+// The simulated source sends the bench ECU pattern (include/bench_ecu_pattern.h,
+// logger config ids) at 10 Hz, so the dashboard decodes it like the car.
 
 // ---- Uplink stress test ---------------------------------------------------
 // Opt-in, off by default. The burst used to publish filler over MQTT. That
@@ -167,17 +160,23 @@
 // How long to wait for an IP once the modem has switched to PPP data mode.
 #define PPP_CONNECT_TIMEOUT_MS 30000
 
-// ---- HTTPS ingest (Helios HTP/1) ---------------------------------------
-// One POST carries 1..HTP_POST_MAX_WINDOWS one-second windows of one group,
-// body is binary HTP/1 for channel set 1.
+// ---- HTTPS ingest (raw CAN batches) -----------------------------------
+// One POST is one batch: {device_id, seq, dropped_frames, frames[]} as in
+// telemetry_format.h, Content-Type application/x-sdm-can-batch+json, stored
+// as-is in telemetry.can_batches and decoded by the dashboard with the car
+// logger's config.json.
 // URL is the edge function, not PostgREST:
 //   https://<project-ref>.supabase.co/functions/v1/telemetry-ingest
-// Auth is HMAC-SHA256 of the raw body, sent as x-htp-signature. Do not send
-// apikey, Authorization, or any Supabase secret. The HMAC key is the device
-// key (TELEMETRY_HMAC_KEY), the same value set on the function.
+// Auth is HMAC-SHA256 of the raw body, sent as x-htp-signature, with the
+// device id in x-htp-device. Do not send apikey, Authorization, or any
+// Supabase secret. The HMAC key is the device key (TELEMETRY_HMAC_KEY), the
+// same value set on the function.
 //
-// HTP_SESSION_ID must already be a row in telemetry.sessions. A random UUID
-// that is not a row is rejected. Channel set 1 must be seeded.
+// Sessions: the board never sends a session id. A signed-in user enters
+// HTP_DEVICE_ID on the dashboard and presses Start session
+// (telemetry.start_session); the function files each batch under that
+// device's running session. With none running it answers 409 and the board
+// holds the batch and retries (see RAW_NO_SESSION_RETRY_MS).
 //
 // TLS runs on the ESP32 (mbedTLS over PPP, or WiFiClientSecure on WiFi STA).
 // netClient.setInsecure() means the link is encrypted but the certificate is
@@ -188,69 +187,49 @@
 //   HTTPS_INGEST_URL=https://<project-ref>.supabase.co/functions/v1/telemetry-ingest
 //   TELEMETRY_HMAC_KEY=<device hmac key>
 //   HTP_DEVICE_ID=esp32-sim7670g-poc-01
-//   HTP_SESSION_ID=<uuid of a telemetry.sessions row>
-//   HTP_CHANNEL_SET_ID=1
 #ifndef HTTPS_INGEST_URL
 #define HTTPS_INGEST_URL ""
 #endif
 #ifndef TELEMETRY_HMAC_KEY
 #define TELEMETRY_HMAC_KEY ""
 #endif
+// The device id typed into the dashboard. 1-128 characters, no quotes or
+// backslashes. The name keeps its HTP_ prefix because the header is x-htp-device.
 #ifndef HTP_DEVICE_ID
 #define HTP_DEVICE_ID "esp32-sim7670g-poc-01"
 #endif
-#ifndef HTP_SESSION_ID
-#define HTP_SESSION_ID ""
+// How often a batch is cut from the queue. The dashboard polls about once a
+// second, so 1 s keeps it fed without extra requests. A POST that takes
+// longer just makes the next batch bigger.
+#ifndef BATCH_WINDOW_MS
+#define BATCH_WINDOW_MS 1000
 #endif
-#ifndef HTP_CHANNEL_SET_ID
-#define HTP_CHANNEL_SET_ID 1
+// Caps on one batch. The server allows 4096 frames; the byte cap keeps one
+// POST under ~1 s on the 921600-baud modem UART (~90 KB/s). JSON is ~95 bytes
+// per classic frame, up to ~240 per 64-byte CAN FD frame.
+#ifndef RAW_BATCH_MAX_FRAMES
+#define RAW_BATCH_MAX_FRAMES 2000
 #endif
-// 1 = synth samples for every channel in set 1, and do not start the CAN task.
-// 0 = sample the CAN map (can_map.h): channels come from the table picked by
-//     CAN_MAP_BENCH. The car table is empty until it is generated from the
-//     logger's config.json, so with 0 and no table every channel is a dropout.
-#ifndef HTP_SYNTH_MODE
-#define HTP_SYNTH_MODE 1
+#ifndef RAW_BATCH_MAX_BYTES
+#define RAW_BATCH_MAX_BYTES (64 * 1024)
 #endif
-// Windows kept per group (one per second, so ~32 s of backlog each). Oldest
-// is dropped beyond this.
-#define HTP_RETRY_QUEUE_MAX 32
-// Windows per POST (protocol max 8). A group with a backlog sends up to this
-// many consecutive windows in one request, so a slow uplink makes fewer,
-// larger POSTs instead of falling further behind.
-#ifndef HTP_POST_MAX_WINDOWS
-#define HTP_POST_MAX_WINDOWS 8
+// CAN frames queued while a POST runs or no session is running; oldest
+// dropped beyond this and reported as dropped_frames. ~88 bytes each, in
+// PSRAM: 8192 frames is ~720 KB, ~40 s at 200 frames/s.
+#ifndef CAN_QUEUE_DEPTH
+#define CAN_QUEUE_DEPTH 8192
 #endif
-// Period of the "[htp] stats" serial line (request time, busy %, queue age).
-#define HTP_STATS_INTERVAL_MS 10000
-#define HTP_BACKOFF_INITIAL_MS 1000
-#define HTP_BACKOFF_MAX_MS 8000
+#define CAN_QUEUE_DEPTH_NO_PSRAM 256
+// Retry period while the server says no session is running (409).
+#define RAW_NO_SESSION_RETRY_MS 2000
+// Backoff for 408/429/5xx/no response.
+#define RAW_BACKOFF_INITIAL_MS 1000
+#define RAW_BACKOFF_MAX_MS 8000
+// Period of the "[raw] stats" serial line.
+#define RAW_STATS_INTERVAL_MS 10000
 // How long one POST, including the TLS handshake, may take before it is
 // treated as a failure and retried after a backoff.
 #define HTTPS_POST_TIMEOUT_MS 15000
-
-// ---- Device identity -----------------------------------------------
-#define TELEMETRY_DEVICE_ID "esp32-sim7670g-poc-01"
-
-// ---- Batching / queue -----------------------------------------------
-// A wider window amortizes the per-POST overhead (HTTP headers + a TLS
-// handshake, if the server does not keep the socket) over more frames, but it
-// NOT reduce the per-frame cost, so it can't rescue a high generator rate.
-// The queue and window are overridable from .env for throughput testing:
-// end-to-end delivery can't exceed CAN_QUEUE_DEPTH frames per BATCH_WINDOW_MS
-// (~34 frames/s at the defaults) however fast the CAN bus or uplink is.
-#ifndef CAN_QUEUE_DEPTH
-#define CAN_QUEUE_DEPTH 512   // frames; oldest dropped when full (~40 KB, in PSRAM)
-#endif
-#ifndef BATCH_WINDOW_MS
-#define BATCH_WINDOW_MS 15000 // how often the net task drains the queue (publishing
-                              // as many batches as it takes to empty it)
-#endif
-#define BATCH_MAX_FRAMES 60   // hard cap on frames per published batch
-// Upper bound on one batch's JSON: the net task stops adding frames before a
-// batch would exceed this (~110 bytes per classic frame, up to ~240 per
-// 64-byte CAN FD frame), so a frame-count cap alone can't overshoot it ~2x.
-#define BATCH_MAX_JSON_BYTES 8192
 
 // ---- Wall-clock (epoch) sync -----------------------------------------
 #define TIME_SYNC_INTERVAL_MS (5UL * 60UL * 1000UL) // resync every 5 minutes
@@ -262,12 +241,3 @@
 // registers, so a short timeout reports a failure that was only slowness.
 #define MODEM_REGISTRATION_TIMEOUT_MS (90UL * 1000UL)
 
-// ---- Offline spooling (LittleFS) --------------------------------------
-#define SPOOL_DIR "/spool"
-#define SPOOL_MAX_FILES 100 // oldest spooled batch dropped beyond this
-// Replay pacing. The net task loops every 50ms, so without a floor here a
-// batch that fails to publish is retried 20x/second -- each attempt pushing
-// kilobytes at the modem over TLS, saturating the AT channel and burning data
-// on a metered SIM to accomplish nothing.
-#define SPOOL_REPLAY_INTERVAL_MS 2000
-#define SPOOL_REPLAY_MAX_BACKOFF_MS 60000

@@ -152,21 +152,22 @@ USB on both). Test procedure, results and open issues: [bench/README.md](bench/R
 
 ## Architecture
 
-Two FreeRTOS tasks + one shared queue, exactly matching the CAN task's output
-regardless of simulated or real CAN source:
+Two FreeRTOS tasks and one queue. The board never decodes CAN: it timestamps
+every frame and posts it untouched; the dashboard decodes with the car
+logger's `config.json`.
 
 ```
-┌─────────────────────┐        ┌──────────────────┐        ┌─────────────────────┐
-│  CAN task (core 0)  │        │  Shared queue     │        │  Net task (core 1)  │
-│  can_handler.cpp     │──push─►│  CanFrame[512]    │──pull─►│  net_task.cpp       │
-│                      │        │  (drop-oldest      │        │                      │
-│  - real: MCP2518FD   │        │   on overflow)      │        │  - modem power-on    │
-│  - sim: synthetic    │        │                      │        │  - LTE + MQTT connect│
-│    generator          │        └──────────────────┘        │  - batch + serialize │
-│  - capture_us at the  │                                     │  - publish, backoff  │
-│    instant of RX      │                                     │  - LittleFS spool    │
-│  - never blocks        │                                     │    on publish fail   │
-└─────────────────────┘                                     └─────────────────────┘
+┌──────────────────────┐        ┌────────────────────┐        ┌──────────────────────┐
+│  CAN task (core 0)   │        │  g_canQueue         │        │  Net task (core 1)   │
+│  can_handler.cpp     │──push─►│  CanFrame[8192]     │──pull─►│  net_task.cpp        │
+│                      │        │  (PSRAM, drop-oldest│        │                      │
+│  - real: MCP2518FD   │        │   on overflow,      │        │  - modem/PPP or WiFi │
+│  - sim: bench ECU    │        │   counted)          │        │  - SNTP              │
+│    pattern           │        └────────────────────┘        │  - 1 batch / second  │
+│  - capture_us at the │                                       │  - HTTPS POST, HMAC  │
+│    instant of RX     │                                       │  - hold on 409,      │
+│  - never blocks      │                                       │    retry on 5xx      │
+└──────────────────────┘                                       └──────────────────────┘
 ```
 
 - **CAN task** captures `esp_timer_get_time()` (monotonic, microsecond) the
@@ -180,44 +181,47 @@ regardless of simulated or real CAN source:
 - **Time sync** (`time_sync.cpp`) is separate from frame capture entirely: it
   tracks an offset between the monotonic clock and true epoch time, synced
   from SNTP (over PPP or WiFi) at boot and every 5 minutes. Each
-  frame's `epoch_ms` is computed by applying that offset to *its own*
-  `capture_us` at serialization time -- a resync only shifts the offset for
-  frames serialized afterward, it never touches an already-captured
-  timestamp.
-- **Net task** owns the modem, MQTT connection, batching, and all
-  reconnect/retry logic. It rechecks modem network registration separately
-  from the MQTT-level connection (a modem can lose LTE registration while
-  MQTT still thinks it's connected).
+  frame's `ts_ms` is computed by applying that offset to *its own*
+  `capture_us` when its batch is built, so frames captured before the first
+  sync still get a correct epoch time.
+- **Net task** owns the modem and the uplink (see [Supabase uplink](#supabase-uplink-raw-can-batches)).
+  It rechecks modem registration separately from the HTTPS posts, and
+  rebuilds PPP after repeated connect failures on a link that claims to be up.
 
-## MQTT payload format
+## Batch format
 
-JSON, documented in `telemetry_format.h`. One published message per batch:
+JSON, documented in `include/telemetry_format.h`. One POST per batch:
 
 ```json
 {
   "device_id": "esp32-sim7670g-poc-01",
-  "seq": 42,
+  "seq": 1794533525123,
+  "sent_ms": 1794533525140,
   "dropped_frames": 0,
   "frames": [
-    { "can_id": 256, "extd": false, "dlc": 8, "data": "0102030405060708", "ts_ms": 1735500000123 },
-    { "can_id": 291, "extd": false, "dlc": 12, "data": "0102030405060708090a0b0c", "ts_ms": 1735500000125, "fd": true, "brs": true }
+    { "can_id": 1000, "extd": false, "dlc": 8, "data": "0003e80a14012c00", "ts_ms": 1794533524001 },
+    { "can_id": 1521, "extd": false, "dlc": 16, "data": "000102030405060708090a0b0c0d0e0f", "ts_ms": 1794533524003, "fd": true, "brs": true }
   ]
 }
 ```
 
-`dlc` is the payload length in **bytes** (0-8 classic, up to 64 for CAN
-FD), not the 4-bit DLC code from the wire. CAN FD frames add `"fd": true`
-and `"brs"` (bit rate switch); classic frames omit both, so they cost no
-extra uplink bytes.
+`dlc` is the payload length in **bytes** (0-8 classic; 0-8, 12, 16, 20, 24,
+32, 48, 64 FD), not the 4-bit DLC code from the wire. CAN FD frames add
+`"fd": true` and `"brs"` (bit rate switch); classic frames omit both. `data`
+is lowercase hex with no prefix.
 
-`ts_ms` is Unix epoch milliseconds, per-frame, at full resolution -- batching
-never averages or collapses timestamps. `dropped_frames` reports the number
-of frames dropped since the *previous* successfully-built batch, so gaps are
-visible server-side even under sustained overload.
-
-JSON is used here for PoC clarity and easy debugging (readable in any MQTT
-client). For production, a binary format (CBOR or protobuf) would
-meaningfully cut per-frame overhead on a Cat-1 link -- see below.
+`ts_ms` is Unix epoch milliseconds, per frame. `seq` is the batch's build
+time in Unix ms: unique per device even across power cuts (see below).
+`sent_ms` is when the POST left the board, in Unix ms (UTC), rewritten
+(and re-signed) on every retry. The ingest function stores it as
+`telemetry.can_batches.sent_at`, the batch's only timestamp (there is no
+server `received_at`); the dashboard takes its own clock minus `sent_at` as
+the board-to-screen latency. Both clocks are NTP, so expect tens of ms of
+skew.
+`dropped_frames` counts frames lost since the previous batch: queue overflow,
+plus the frames of any batch the server rejected. `device_id` must match the
+signed `x-htp-device` header. At most 4096 frames per batch (server limit);
+the board caps batches at `RAW_BATCH_MAX_FRAMES` / `RAW_BATCH_MAX_BYTES`.
 
 ## Configuration
 
@@ -234,19 +238,15 @@ Edit `include/telemetry_config.h`:
 |---|---|
 | `TELEMETRY_USE_SIMULATED_CAN` | `1` = synthetic frames (no CAN hardware needed), `0` = real CAN (MCP2518FD or TWAI, per `CAN_USE_MCP2518FD` in `include/can_pins.h`) |
 | `TELEMETRY_USE_WIFI` | `1` = transmit over the ESP32-S3's onboard WiFi radio instead of the cellular modem (bench testing without a SIM); `0` = cellular (default, real deployment path) |
-| `WIFI_AP_MODE` | Only used when `TELEMETRY_USE_WIFI=1`. `1` = the ESP32-S3 hosts its own network (`WIFI_AP_SSID`/`_PASSWORD`) for your laptop/phone to join directly -- no existing WiFi needed, but no internet uplink either, so nothing is POSTed, and NTP time sync is skipped (so the sampler never starts). `0` = join an existing network instead (the settings below). |
+| `WIFI_AP_MODE` | Only used when `TELEMETRY_USE_WIFI=1`. `1` = the ESP32-S3 hosts its own network (`WIFI_AP_SSID`/`_PASSWORD`) for your laptop/phone to join directly -- no existing WiFi needed, but no internet uplink either, so nothing is POSTed, and NTP time sync is skipped (frames just cycle through the queue). `0` = join an existing network instead (the settings below). |
 | `WIFI_SSID`, `WIFI_ENTERPRISE`, `WIFI_PASSWORD` / `WIFI_EAP_*` | Only used when `TELEMETRY_USE_WIFI=1` and `WIFI_AP_MODE=0`. Set `WIFI_ENTERPRISE=1` for WPA2/WPA3-Enterprise networks (802.1X, e.g. eduroam or a corporate network) that ask for a username **and** password to join directly -- PEAP/MSCHAPv2 only, not EAP-TLS. Leave it `0` for an ordinary single-password network. |
 | `TELEMETRY_APN` / `_USER` / `_PASS` | Your carrier's APN credentials (cellular mode only) |
 | `HTTPS_INGEST_URL` | Edge function URL: `https://<project-ref>.supabase.co/functions/v1/telemetry-ingest`. Not `/rest/v1/`. Put it in `.env`, then reflash. |
 | `TELEMETRY_HMAC_KEY` | Device HMAC key. Sent only as `x-htp-signature` over the raw body. Same value as the function's `TELEMETRY_HMAC_KEY`. Never a Supabase secret. Put it in `.env`. |
-| `HTP_DEVICE_ID` | `x-htp-device` header. |
-| `HTP_SESSION_ID` | UUID of an existing `telemetry.sessions` row. The row is created out of band with the service role (the Helios dev kit's `npm run session`; Postgres generates the UUID); the ingest function never creates one. An id that is not a row gets HTTP 500 on every POST. See `docs/live-dashboard.md` "Sessions". |
-| `HTP_CHANNEL_SET_ID` | Must be `1` (`SDM26-cell-v1`) until another set is frozen. |
-| `HTP_SYNTH_MODE` | `1` (default) = synth every channel in set 1 and do not start CAN. `0` = sample real (or simulated) CAN through the CAN map. |
-| `CAN_MAP_BENCH` | `0` (default) = car signal table `include/can_map_car.h` (empty until generated from the logger config). `1` = bench table, decodes the C5's ECU pattern and the simulated CAN source. |
-| `CAN_STALE_MS` | A CAN channel not received for this long is sent as a dropout, not its last value. Default 1500. |
-| `HTP_POST_MAX_WINDOWS` | Windows per POST, 1..8 (default 8). Each group keeps up to `HTP_RETRY_QUEUE_MAX` (32) one-second windows in RAM; a POST sends as many consecutive ones of a group as are queued, up to this. |
-| `CAN_QUEUE_DEPTH`, `BATCH_WINDOW_MS`, `BATCH_MAX_FRAMES`, `BATCH_MAX_JSON_BYTES` | Left over from the JSON CAN path. The HTP uplink does not use them. |
+| `HTP_DEVICE_ID` | The device id: `x-htp-device` header and the body's `device_id`. This is what you type into the dashboard before pressing Start session. 1-128 characters, no `"` or `\`. |
+| `BATCH_WINDOW_MS` | How often a batch is cut from the queue (default 1000). A POST that takes longer only makes the next batch bigger. |
+| `RAW_BATCH_MAX_FRAMES`, `RAW_BATCH_MAX_BYTES` | Caps on one batch (defaults 2000 frames, 64 KB of JSON; the server allows 4096 frames). Frames over the cap wait for the next batch. |
+| `CAN_QUEUE_DEPTH` | Frames held while a POST runs or no session is running (default 8192, in PSRAM, ~720 KB). The oldest are dropped beyond this and reported in `dropped_frames`. |
 | `TELEMETRY_STRESS_TEST` | Leave `0`. The old MQTT filler burst is not POSTed to the ingest URL. |
 | `MODEM_USB_BENCH_MODE` | `1` = power the modem on and stop -- no registration/MQTT/stress test, UART1 stays silent so a PC can drive the modem directly over its own USB port (see [USB direct-to-modem bench](#usb-direct-to-modem-bench-bypassing-the-esp32-modem-uart)); `0` = normal operation (default). Cellular only. |
 | `SMS_TEST_ENABLED` | `1` = send one test SMS after the modem registers on the network, to `SMS_TEST_NUMBER` (see `include/sms_config.h`); `0` = off (default). Cellular only -- build error under `TELEMETRY_USE_WIFI=1` |
@@ -300,105 +300,99 @@ involved.
    listener, and click Connect. Renders each batch's `frames[]` as a live
    table plus running batch/seq/dropped-frame counters.
 
-## Supabase uplink (HTP/1)
+## Supabase uplink (raw CAN batches)
 
-The board POSTs binary HTP/1 to the `telemetry-ingest` edge function
-(`docs/wire-protocol.md`). The function stages every window in
-`telemetry.staging_chunks` and broadcasts the latest sample of each POST on
-Realtime topic `telemetry:live:{session_id}`. The dashboard side of that
-broadcast is in [`docs/live-dashboard.md`](docs/live-dashboard.md).
+The board POSTs every received CAN frame, undecoded, to the `telemetry-ingest`
+edge function, which stores each batch as a row of `telemetry.can_batches`
+(`frames` jsonb). The dashboard
+([SDM-Live-Telemetry-Dashboard](https://github.com/sundevilmotorsports/SDM-Live-Telemetry-Dashboard),
+`src/telemetry/raw/`) polls that table and decodes the frames with the car
+logger's `config.json` (`scale * (raw - offset)`, fixed and muxed signals).
+Nothing is scaled or mapped on the car, so a logger config change needs no
+firmware change.
 
-**Status (2026-10-29):** the default build still sends synthetic samples
-(`HTP_SYNTH_MODE=1`). The CAN path (`HTP_SYNTH_MODE=0`) is built and
-host-tested against the bench table, but the car's signal table is empty
-until it is generated from the logger's `config.json`. The session is the
-fixed `HTP_SESSION_ID`; starting sessions from the dashboard is not built.
-The host tools below were run against the team project; the board itself
-has not posted over LTE with this firmware yet.
+Request: `POST` with `Content-Type: application/x-sdm-can-batch+json`,
+`x-htp-device: <HTP_DEVICE_ID>`, `x-htp-signature: <hex HMAC-SHA256 of the
+raw body with TELEMETRY_HMAC_KEY>`. No Supabase key.
 
-How the board samples and sends:
+**Sessions.** The board never sends a session id. On the dashboard a
+signed-in user enters the device id and presses **Start session**
+(`telemetry.start_session`, which ends that device's previous running
+session). The function files each batch under the device's running session.
+**End session** ends it.
 
-- A sampler task ticks at 10 Hz on wall-clock 100 ms boundaries once SNTP
-  has synced. Each tick snapshots every channel (synth, or the latest CAN
-  value); 1 Hz channels use the tick at :00. After the tick at .9 s the
-  second's window for each group (3 groups) is queued. It runs apart from
-  the net task, so a slow POST never stalls sampling.
-- `seq` is the window's unix second, so a reboot with the same
-  `HTP_SESSION_ID` never collides with data already stored (the server would
-  ack a reused seq as `dup` and keep the old window).
-- POSTs go one at a time, oldest queued window first. If the uplink falls
-  behind, a POST carries up to `HTP_POST_MAX_WINDOWS` consecutive windows of
-  one group, so the request rate drops while it catches up.
-- A kept-alive TLS socket that the server has closed is retried once on a
-  new connection before backing off.
+How the board sends:
 
-What it prints (lines from the host test below, with a fake 300 ms server,
-not from the board):
+- Once a second it drains the CAN queue into one batch and POSTs it. One
+  batch is in flight at a time and is resent until the server has it, so a
+  retry carries the same `seq` and frames; only `sent_ms` (and so the
+  signature) changes.
+- While a POST is slow or failing, new frames wait in the queue and the next
+  batch takes as many as fit (`RAW_BATCH_MAX_FRAMES`, `RAW_BATCH_MAX_BYTES`),
+  so a stalled uplink catches up in a few big batches.
+- `seq` is the build time in Unix ms. The server dedupes on
+  (session, device, seq); a counter that restarted at 0 after a power cut
+  would have its first batches acked as `dup` and dropped. No batch is
+  built until SNTP has synced.
+
+| Server answer | Board |
+|---|---|
+| 2xx (stored, or `dup` of a batch it already has) | next batch |
+| 409 no running session | keeps the batch, retries every 2 s (`RAW_NO_SESSION_RETRY_MS`), logs `waiting for Start session` once. Frames keep queueing; the oldest drop past `CAN_QUEUE_DEPTH`. When Start is pressed, the held batch and the queue go into the new session. |
+| 408, 429, 5xx, no response | same batch again after a backoff (1 s doubling to 8 s); a kept-alive socket the server closed is retried at once on a new one |
+| other 4xx (400 malformed, 401 bad signature) | drops the batch, logs the body, counts its frames in the next batch's `dropped_frames` |
+
+What it prints (from the host test below, fake 100 ms server, not the board):
 
 ```
-[htp] g0 seq=1793320172+2 (932 B) 200 in 300 ms (server 42 ms, reused) age=1150 ms queued=0/0/0
-[htp] stats 10s: posts 29 ok/0 failed, 31 windows (3.1/s), req avg 300 max 300 ms, busy 86%, reused 29/29, queued 1/1/0, oldest 300 ms, dropped 57, rejected 1
+[raw] no running session for device bench-s3; waiting for Start session on the dashboard (retry every 2000 ms)
+[raw] seq=1793320042950 21 frames (1887 B, dropped 0) 200 in 100 ms (reused) age=1050 ms queued=2
+[raw] stats 10s: posts 10 ok/0 failed, 1252 frames (125.2/s), 22.1 kB/s, req avg 100 max 100 ms, busy 10%, reused 10/10, queued 19, pending no, dropped 486, rejected 1
 ```
 
-`age` is how old the newest sample in the POST was when the ack came back
-(about what the dashboard sees). `busy` is the share of time spent inside
-POSTs: near 100% the queues grow and `oldest` climbs. `reused` counts
-requests that skipped the TLS handshake.
+`age` is how old the batch's first frame was when the server had it. `busy`
+is the share of time spent inside POSTs: near 100% the queue grows.
 
-Host checks (no board needed). The first runs the queue logic of
-`net_task.cpp` against a fake server and clock (batching, retries, drops,
-stale socket); the rest read `.env` and talk to the real project:
+Data use on cellular: ~95 bytes of JSON per classic frame, so the bench
+pattern (~21 frames/s) is ~2 kB/s, ~7 MB/hour (90 bytes/frame measured in the host test). The modem UART caps the
+uplink at ~90 kB/s, roughly 900 classic frames/s.
+
+**Power loss.** The board is expected to lose power with no shutdown. It
+writes nothing to flash at runtime, so a cut cannot corrupt anything. What is
+lost is what was still in RAM: the queue and the batch in flight. The logger
+is the full record. On the next boot the board posts into whatever session
+is running for its device id, with new seqs.
+
+Host checks (no board needed):
 
 ```sh
-sh tools/htp_uplink_host/run.sh
-sh tools/check_helios_fixtures.sh                          # encoder vs Helios golden frames
-c++ -std=c++17 -O2 -Iinclude tools/htp_emit_sample.cpp src/htp_frame.cpp -o tools/htp_emit_sample
-.venv/bin/python scripts/post_synth_htp.py                 # one second, 3 POSTs
-.venv/bin/python scripts/post_synth_htp.py --windows 8     # one 8-window frame per group
-.venv/bin/python scripts/post_synth_htp.py --seconds 30    # 1 Hz like the board
-.venv/bin/python scripts/watch_live.py --seconds 40        # subscribe like a browser
+sh tools/raw_uplink_host/run.sh      # uplink logic vs a fake server, then decode check
+.venv/bin/python scripts/post_bench_can.py --device bench-mac --seconds 30   # real project
 ```
 
-`watch_live.py` uses the publishable key (`HTTPS_API_KEY` in `.env`) and
-prints each broadcast's arrival interval and age per group, flagging any
-that arrive older than one already shown.
+`run.sh` compiles the uplink section of `net_task.cpp` and the real frame
+serializer against stubs (fake clock, queue, server) and runs: frames
+captured before SNTP, steady state, 15 s with no session (409), queue
+overflow, 503, 400, a stale kept-alive socket, an outage under a 64-byte FD
+flood (byte cap), and a reboot (seq keeps increasing). It then decodes
+everything the fake server stored with a Python port of the logger's decode
+rules and `tools/logger_config/config.json` (logger @ 9338e3c, the same file
+the dashboard vendors), and checks every bench frame's values.
 
-### CAN to channel set 1
+`post_bench_can.py` posts the bench pattern from the Mac, signed like the
+board, one batch a second; press Start session for the device on the
+dashboard first (it waits on 409). It writes real rows.
 
-The CAN task decodes every frame straight into `can_map` (latest value and
-receive time per channel); there is no frame queue. Signals use the car
-logger's definition (sundevilmotorsports/logger `src/can.rs`): bytes
-`start..start+len`, little-endian unless `big_endian`, optional sign,
-optional mux byte, `value = scale * (raw - offset)`. Generate the car table
-from the logger's SD-card `config.json`:
-
-```sh
-python3 tools/logger_config_to_can_map.py config.json --bus Engine > include/can_map_car.h
-python3 tools/logger_config_to_can_map.py config.json --map "Oil P=engine.oil_pressure" ...
-```
-
-Names are matched to channel ids through `aliases:` in `docs/channels.yaml`;
-unmatched signals are listed. A channel never received, or not received for
-`CAN_STALE_MS`, is sent as a dropout (NaN -> i16 `-32768`), never as 0 or as
-a frozen value. The logger itself writes 0 for never-seen signals and keeps
-stale values, so the two records can differ there. With `HTP_SYNTH_MODE=0`
-the board prints a `[can-map]` line every 5 s (frames seen/matched, fresh
-channels, a few values), which works before the clock syncs.
-
-Bench check without the car: build the S3 with `HTP_SYNTH_MODE=0
-CAN_MAP_BENCH=1 TELEMETRY_USE_SIMULATED_CAN=0`, press `e` on the C5's serial
-console (ECU pattern, `include/bench_ecu_pattern.h`), and watch the
-`[can-map]` line show rpm, tps, water temp, gear, brakes and g. Leaving
+Bench check with both boards: flash the S3 with `TELEMETRY_USE_SIMULATED_CAN=0`,
+press `e` on the C5's serial console (bench ECU pattern,
+`include/bench_ecu_pattern.h`: rpm, coolant, oil, TPS, gear, fuel, IMU on the
+logger's ids, plus a CAN FD frame), start a session on the dashboard for the
+board's device id, and the dashboard's rpm/coolant/gear gauges should move.
 `TELEMETRY_USE_SIMULATED_CAN=1` sends the same pattern with no bus at all.
 
-### Power loss
-
-The board is expected to lose power with no shutdown. It writes nothing to
-flash at runtime (no spool, no settings), so a cut cannot corrupt anything.
-What is lost is the RAM queue: up to `HTP_RETRY_QUEUE_MAX` seconds per group
-that were not yet acked, plus the second being sampled. The car's logger is
-the full record; the uplink is for live viewing. On the next boot the board
-continues the same session with new seqs (unix seconds).
+The older HTP/1 path (decoded channel set 1, `docs/live-dashboard.md`,
+`scripts/post_synth_htp.py`, `scripts/watch_live.py`) is no longer used by
+the firmware. The ingest function still accepts it.
 
 ## Demonstration checklist (real CAN hardware)
 
